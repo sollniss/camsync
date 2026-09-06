@@ -1,0 +1,174 @@
+# camsync
+
+Fix the clock of a camera after the fact. `camsync` scans a directory of
+photos, groups them by camera (EXIF Make/Model) and lets you shift the
+timestamps of one camera by a few seconds, minutes or hours so that photos
+from several cameras sort in the correct order.
+
+**Image files are never modified.** All changes are written to XMP sidecar
+files, which Lightroom, darktable, digiKam, exiftool and most other tools
+read. Existing sidecars are updated in place and their other content is kept.
+
+## Build
+
+```sh
+go build -o camsync ./cmd/camsync
+```
+
+## Usage
+
+```
+camsync list  [DIR] [-v] [-r] [-o table|json]
+camsync shift [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
+camsync reset [DIR] --camera NAME [--dry-run]
+```
+
+1. See which cameras are in the directory:
+
+   ```
+   $ camsync list ~/Photos/2024-trip
+   #  CAMERA         FILES  FIRST                LAST                 OFFSET  SIDECARS  NOTES
+   1  Canon EOS R5   132    2024-05-01 08:12:03  2024-05-04 19:44:10  none    0
+   2  SONY ILCE-7M3  88     2024-05-01 08:10:55  2024-05-04 19:40:01  none    0
+   ```
+
+2. Shift one camera. `--camera` takes the name case-insensitively, the row
+   number from the list, or a unique substring of the name:
+
+   ```
+   $ camsync shift --camera sony --by 2m30s ~/Photos/2024-trip
+   ```
+
+   Use `--dry-run` (`-n`) first. Shifts accumulate: running `--by 30s` twice
+   shifts by one minute. `list` shows the offset currently applied.
+
+3. Undo everything for a camera with `reset`, which writes the timestamps
+   from the image files back into the sidecars.
+
+Durations: `2m30s`, `-45s`, `1h`, `+1d2h`. A leading sign applies to the whole
+value. `--timezone +02:00` (or `--tz`) stamps a zone on the written dates (see Timezones). Add
+`-r` to include sub-directories. Every command has `--help` with examples.
+
+### Output for scripts
+
+`--output json` (`-o json`) prints the same information as a JSON document
+instead of a table, for `list` as well as `shift` and `reset`:
+
+```sh
+camsync list -o json ~/Photos/trip | jq -r '.cameras[] | "\(.index) \(.camera) \(.offset)"'
+```
+
+Timestamps are ISO 8601 strings with the zone when known.
+
+With `-o json` the document is still printed before exit code 1 when some
+sidecars failed, so scripts can see which ones.
+
+### Configuration
+
+Persistent settings live in `$XDG_CONFIG_HOME/camsync/config.yaml`
+(usually `~/.config/camsync/config.yaml`; `config.json` works too),
+or in the file given with `--config`:
+
+```yaml
+sidecar-style: ext # or name
+recursive: false
+output: table # or json
+```
+
+Environment variables override the file (`CAMSYNC_SIDECAR_STYLE=name`,
+`CAMSYNC_RECURSIVE=true`, `CAMSYNC_OUTPUT=json`), and flags override
+both.
+
+### Shell completion
+
+The binary generates completion scripts for bash, zsh, fish and PowerShell.
+Completion covers commands, flags, directories, and the values of
+`--sidecar-style`, `--output` and `--camera`; the latter scans the directory
+on the command line and offers the camera names and row numbers it finds.
+
+```sh
+# bash (~/.bashrc)
+source <(camsync completion bash)
+# zsh (~/.zshrc, before compinit)
+camsync completion zsh > "${fpath[1]}/_camsync"
+# fish
+camsync completion fish > ~/.config/fish/completions/camsync.fish
+```
+
+`camsync completion --help` has the details for each shell.
+
+## What gets written
+
+The sidecar receives the shifted time as `exif:DateTimeOriginal`,
+`exif:DateTimeDigitized` (if the source has one), `xmp:CreateDate` and
+`photoshop:DateCreated`. New sidecars also get `tiff:Make` and `tiff:Model`.
+Fractional seconds and the UTC offset (`OffsetTimeOriginal`) of the original
+are preserved.
+
+Timestamps are read from the sidecar first and from the image file only when
+the sidecar has none. The camera name comes from the sidecar's `tiff:Make` and
+`tiff:Model` when present, otherwise from the image.
+
+Sidecar naming: new sidecars are `IMG_0001.JPG.xmp` by default, which is
+what Immich, exiftool and darktable use. `--sidecar-style name` creates
+`IMG_0001.xmp` instead (Adobe, digiKam). Existing sidecars of either style
+are found regardless of the flag. With the `name` style two images that
+differ only by extension (`IMG_0001.JPG` and `IMG_0001.CR2`) would share
+`IMG_0001.xmp`; such files are reported and skipped.
+
+New sidecars use the same layout exiftool writes (one `rdf:Description` per
+namespace, properties as child elements), so exiftool-based readers such as
+Immich parse them exactly like their own.
+
+## Timezones
+
+Cameras record wall-clock time. Shifting never converts between zones; it
+moves the wall clock and keeps the zone of the source, if any:
+
+- EXIF `OffsetTimeOriginal` (EXIF 2.31, cameras from about 2019 on) or the
+  `OffsetTime` / `OffsetTimeDigitized` tags when that one is missing.
+- The camera's configured zone from the maker note, chosen by the `Make`
+  tag: Canon's `TimeInfo` record (written since about 2009, DST included)
+  and Nikon's `WorldTime` record (base zone plus a DST flag, which adds an
+  hour). exiftool reports both as `TimeZone` and Immich uses them, so the
+  sidecar gets the same zone Immich already shows for the image.
+- The zone of an existing sidecar date.
+
+If none of these exist, the written date has no zone, which `list -v` shows
+by printing the timestamp without an offset. That matters for Immich: it
+knows the zone from the image but treats a zone-less sidecar date as UTC, so
+the photo would appear shifted by the zone offset. Pass `--timezone +02:00` (any
+`+hh:mm`, or `Z`; `--tz` is an alias) to stamp a zone on the written dates. It can be used
+without `--by` to fix the zone alone. Other makers' maker notes are not read;
+use `--timezone` for those.
+
+Phones usually store no zone at all. Immich derives one from the GPS
+coordinates or the GPS clock, so it shows a zone where `list` shows none.
+That is expected: a phone's clock is network-synced, so it is the reference
+you align other cameras to, not something you shift.
+
+## Immich
+
+Immich only looks for sidecars when its sidecar job runs; the external
+library scan and file watcher ignore `.xmp` files, and a rescan only
+re-reads an asset when the image itself changed. After running `shift`:
+
+Administration → Jobs → **Sidecar Metadata** → **Sync** picks up new sidecars.
+
+## Supported formats
+
+Detection is by file content, not extension.
+
+| Container                           | Extensions                                                                                                    |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| JPEG                                | jpg, jpeg, jpe, jfif                                                                                          |
+| TIFF and TIFF-based raw             | tif, tiff, dng, cr2, nef, nrw, arw, srf, sr2, pef, orf, rw2, rwl, srw, 3fr, fff, erf, mef, mos, kdc, dcr, iiq |
+| Canon CR3                           | cr3                                                                                                           |
+| Fujifilm RAF                        | raf (EXIF from the embedded JPEG)                                                                             |
+| Minolta MRW                         | mrw                                                                                                           |
+| PNG (`eXIf` chunk)                  | png                                                                                                           |
+| WebP (`EXIF` chunk)                 | webp                                                                                                          |
+| HEIF / HEIC / AVIF                  | heic, heif, hif, avif                                                                                         |
+| JPEG XL (container with `Exif` box) | jxl                                                                                                           |
+
+Files without a readable timestamp are listed but skipped when shifting.
