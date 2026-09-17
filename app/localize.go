@@ -74,25 +74,9 @@ func (h LocalizeHandler) Handle(ctx context.Context, cmd LocalizeCommand) (*Loca
 	if err := cmd.Validate(); err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	res, err := cmd.scan(ctx)
+	clocks, selected, err := estimate(ctx, cmd.Scope, cmd.ClockSettings, cmd.Camera)
 	if err != nil {
 		return nil, err
-	}
-	groups := camsync.GroupPhotos(res.Photos)
-	opts, err := cmd.options(groups)
-	if err != nil {
-		return nil, err
-	}
-	selected := groups
-	if cmd.Camera != "" {
-		g, err := camsync.SelectGroup(groups, cmd.Camera)
-		if err != nil {
-			return nil, invalid(err)
-		}
-		selected = []*camsync.Group{g}
 	}
 	var lopts camsync.LocalizeOptions
 	if cmd.Zone != "" {
@@ -100,7 +84,6 @@ func (h LocalizeHandler) Handle(ctx context.Context, cmd LocalizeCommand) (*Loca
 		lopts.Zone = &z
 	}
 
-	clocks := camsync.EstimateClocks(groups, opts)
 	out := &LocalizeResult{DryRun: cmd.DryRun, Evidence: clocks.Timeline.Len()}
 	for _, g := range selected {
 		est := clocks.Estimate(g)
@@ -139,4 +122,30 @@ func (h LocalizeHandler) Handle(ctx context.Context, cmd LocalizeCommand) (*Loca
 		}
 	}
 	return out, nil
+}
+
+// estimate scans the scope, estimates every camera's clock and returns the
+// groups selected by camera, all of them when it is empty.
+func estimate(ctx context.Context, scope Scope, settings ClockSettings, camera string) (*camsync.Clocks, []*camsync.Group, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	res, err := scope.scan(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	groups := camsync.GroupPhotos(res.Photos)
+	opts, err := settings.options(groups)
+	if err != nil {
+		return nil, nil, err
+	}
+	selected := groups
+	if camera != "" {
+		g, err := camsync.SelectGroup(groups, camera)
+		if err != nil {
+			return nil, nil, invalid(err)
+		}
+		selected = []*camsync.Group{g}
+	}
+	return camsync.EstimateClocks(groups, opts), selected, nil
 }

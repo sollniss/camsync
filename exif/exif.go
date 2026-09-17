@@ -13,6 +13,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -37,6 +38,13 @@ const (
 	// plus fractional seconds when present, GPSDateStamp as "2006:01:02".
 	TagGPSTimeStamp = 0x0007
 	TagGPSDateStamp = 0x001D
+	// The coordinates are stored as signed decimal degrees ("-33.8568"),
+	// south and west negative; the reference tags are folded in.
+	TagGPSLatitude  = 0x0002
+	TagGPSLongitude = 0x0004
+
+	tagGPSLatitudeRef  = 0x0001
+	tagGPSLongitudeRef = 0x0003
 )
 
 var wantedTags = map[uint16]bool{
@@ -177,34 +185,33 @@ func newTIFFReader(r io.ReaderAt, base, size int64) (*tiffReader, int64, error) 
 	return t, int64(t.bo.Uint32(hdr[4:8])), nil
 }
 
-// readGPS collects GPSTimeStamp and GPSDateStamp from the GPS IFD at off. A
+// readGPS collects the time, date and coordinates from the GPS IFD at off. A
 // damaged GPS IFD is ignored; it must not cost the photo its other tags.
 func (t *tiffReader) readGPS(off int64, tags Tags) {
 	entries, err := t.ifdEntries(off, t.bo)
 	if err != nil {
 		return
 	}
+	var lat, lon [3]float64
+	var latOK, lonOK bool
+	var latRef, lonRef byte
 	for i := 0; i+12 <= len(entries); i += 12 {
 		e := entries[i : i+12]
 		tag, typ, count := t.bo.Uint16(e[0:2]), t.bo.Uint16(e[2:4]), t.bo.Uint32(e[4:8])
 		switch {
 		case tag == TagGPSTimeStamp && typ == 5 && count == 3: // three RATIONALs
-			b, err := t.bytes(int64(t.bo.Uint32(e[8:12])), 24)
-			if err != nil {
-				continue
-			}
-			var hms [3]float64
-			valid := true
-			for j := range hms {
-				num, den := t.bo.Uint32(b[j*8:]), t.bo.Uint32(b[j*8+4:])
-				valid = valid && den != 0
-				if den != 0 {
-					hms[j] = float64(num) / float64(den)
-				}
-			}
-			if s, ok := formatGPSTime(hms); ok && valid {
+			hms, ok := t.rationals3(e)
+			if s, valid := formatGPSTime(hms); ok && valid {
 				tags[TagGPSTimeStamp] = s
 			}
+		case tag == TagGPSLatitude && typ == 5 && count == 3:
+			lat, latOK = t.rationals3(e)
+		case tag == TagGPSLongitude && typ == 5 && count == 3:
+			lon, lonOK = t.rationals3(e)
+		case tag == tagGPSLatitudeRef && typ == 2 && count >= 1:
+			latRef = e[8]
+		case tag == tagGPSLongitudeRef && typ == 2 && count >= 1:
+			lonRef = e[8]
 		case tag == TagGPSDateStamp && typ == 2 && count > 4 && count <= 64:
 			if b, err := t.bytes(int64(t.bo.Uint32(e[8:12])), int64(count)); err == nil {
 				if s := cleanString(b); s != "" {
@@ -213,6 +220,47 @@ func (t *tiffReader) readGPS(off int64, tags Tags) {
 			}
 		}
 	}
+	s, latValid := coordinate(lat, latRef, 'N', 'S', 90)
+	l, lonValid := coordinate(lon, lonRef, 'E', 'W', 180)
+	if latOK && lonOK && latValid && lonValid && (lat != [3]float64{} || lon != [3]float64{}) {
+		tags[TagGPSLatitude], tags[TagGPSLongitude] = s, l
+	}
+}
+
+// rationals3 reads the three RATIONAL values of an IFD entry. It reports
+// false when they cannot be read or one has a zero denominator.
+func (t *tiffReader) rationals3(e []byte) ([3]float64, bool) {
+	var v [3]float64
+	b, err := t.bytes(int64(t.bo.Uint32(e[8:12])), 24)
+	if err != nil {
+		return v, false
+	}
+	for j := range v {
+		num, den := t.bo.Uint32(b[j*8:]), t.bo.Uint32(b[j*8+4:])
+		if den == 0 {
+			return v, false
+		}
+		v[j] = float64(num) / float64(den)
+	}
+	return v, true
+}
+
+// coordinate turns degrees, minutes and seconds with a reference letter into
+// signed decimal degrees. Receivers without a fix write 0/0 or leave out the
+// reference; both are rejected.
+func coordinate(dms [3]float64, ref, pos, neg byte, limit float64) (string, bool) {
+	d := dms[0] + dms[1]/60 + dms[2]/3600
+	switch ref {
+	case pos:
+	case neg:
+		d = -d
+	default:
+		return "", false
+	}
+	if d > limit || d < -limit || dms[1] > 60 || dms[2] > 60 { // 60 itself comes from rounding
+		return "", false
+	}
+	return strconv.FormatFloat(d, 'f', 7, 64), true
 }
 
 // formatGPSTime renders hours, minutes and seconds as "15:04:05", adding the

@@ -514,3 +514,112 @@ func TestLocalizeFlow(t *testing.T) {
 		}
 	}
 }
+
+// geoDir writes a phone walking north with GPS, a camera on Japan time
+// photographing in between and once much later, and a GPS camera.
+func geoDir(t *testing.T) string {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	start := time.Date(2017, 8, 10, 8, 0, 0, 0, time.UTC)
+	write := func(name, mk, model string, wall time.Time, tz string, gps *time.Time, lat float64) {
+		ifd0 := []testimg.Entry{testimg.ASCII(exif.TagMake, mk), testimg.ASCII(exif.TagModel, model)}
+		if gps != nil {
+			ifd0 = append(ifd0, testimg.GPSAt(binary.LittleEndian, gps.Format("2006:01:02"), gps.Hour(), gps.Minute(), float64(gps.Second()), lat, 13.43))
+		}
+		exifIFD := []testimg.Entry{testimg.ASCII(exif.TagDateTimeOriginal, wall.Format("2006:01:02 15:04:05")), testimg.ASCII(exif.TagOffsetTimeOriginal, tz)}
+		mustWrite(t, filepath.Join(dir, name), testimg.JPEG(testimg.BuildTIFF(binary.LittleEndian, ifd0, exifIFD)))
+	}
+	for i := range 4 {
+		utc := start.Add(time.Duration(i*4) * time.Minute)
+		write(fmt.Sprintf("IMG_%d.JPG", i), "Apple", "iPhone 15", utc.Add(2*time.Hour), "+02:00", &utc, 54.4+float64(i)*0.0036)
+	}
+	for _, m := range []int{2, 6, 10, 90} {
+		write(fmt.Sprintf("CAN_%03d.JPG", m), "Canon", "Canon PowerShot G9 X", start.Add(time.Duration(m)*time.Minute+9*time.Hour), "+09:00", nil, 0)
+	}
+	gps := start.Add(5 * time.Minute)
+	write("GPS_1.JPG", "Nikon", "Nikon Z 6", gps.Add(2*time.Hour), "+02:00", &gps, 54.5)
+	return dir
+}
+
+func TestGeotagFlow(t *testing.T) {
+	dir := geoDir(t)
+	code, out, errOut := run(t, "geotag", "-n", dir)
+	if code != 0 || errOut != "" {
+		t.Fatalf("code %d, stderr %q\n%s", code, errOut, out)
+	}
+	for _, want := range []string{
+		"Apple iPhone 15       4      4        0        0             4        -           -",
+		"Canon PowerShot G9 X  4      0        3        2             1        2m          2m",
+		"Nikon Z 6             1      1        0        0             1        -           -",
+		"Canon PowerShot G9 X: 1 no located photo within 15m",
+		"dry run: 3 sidecars written (3 new), 6 skipped (5 located, 0 already geotagged), 0 failed; positions from 5 located photos",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry run lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CAN_002.JPG.xmp")); err == nil {
+		t.Fatal("dry run wrote a sidecar")
+	}
+
+	code, out, _ = run(t, "geotag", "-v", "-c", "canon", dir)
+	if code != 0 || !strings.Contains(out, "create  "+filepath.Join(dir, "CAN_002.JPG")+": 54.4018000, 13.4300000 (between IMG_0.JPG and IMG_1.JPG, 2m)  (CAN_002.JPG.xmp)") {
+		t.Errorf("geotag: %d\n%s", code, out)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "CAN_002.JPG.xmp"))
+	if f, _ := xmp.Read(data); f[xmp.GPSLatitude] != "54,24.108000N" || f[xmp.GPSLongitude] != "13,25.800000E" || f[xmp.GPSProcessingMethod] != "camsync" {
+		t.Errorf("sidecar = %v", f)
+	}
+
+	code, out, _ = run(t, "geotag", "-o", "json", dir)
+	var v struct {
+		Written, Unchanged, Evidence int
+		Cameras                      []struct {
+			Camera  string `json:"camera"`
+			Entries []struct {
+				Path     string `json:"path"`
+				Position *struct {
+					Lat, Lon     float64
+					Gap, From    string
+					Interpolated bool
+				} `json:"position"`
+			} `json:"entries"`
+		} `json:"cameras"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); code != 0 || err != nil {
+		t.Fatalf("%d %v\n%s", code, err, out)
+	}
+	if v.Written != 0 || v.Unchanged != 3 || v.Evidence != 5 {
+		t.Errorf("second run = %+v", v)
+	}
+
+	// Localizing leaves the positions alone, reset removes them.
+	if code, out, _ := run(t, "localize", dir); code != 0 {
+		t.Fatal(out)
+	}
+	code, out, _ = run(t, "reset", "-c", "canon", dir)
+	if code != 0 {
+		t.Fatal(out)
+	}
+	data, _ = os.ReadFile(filepath.Join(dir, "CAN_002.JPG.xmp"))
+	if f, _ := xmp.Read(data); f[xmp.GPSLatitude] != "" || f[xmp.GPSProcessingMethod] != "" || f[xmp.DateTimeOriginal] != "2017-08-10T17:02:00+09:00" {
+		t.Errorf("after reset: %v\n%s", f, data)
+	}
+	if code, out, _ := run(t, "geotag", "-n", "-c", "canon", dir); code != 0 || !strings.Contains(out, "3 sidecars written (0 new)") {
+		t.Errorf("after reset: %d\n%s", code, out)
+	}
+
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"geotag", "--max-gap", "-1m", dir}, "--max-gap must be positive"},
+		{[]string{"geotag", "--max-bridge", "soon", dir}, "invalid duration"},
+		{[]string{"geotag", "-c", "nikon z 7", dir}, "no camera matches"},
+	} {
+		if code, _, errOut := run(t, c.args...); code != ExitUsage || !strings.Contains(errOut, c.want) {
+			t.Errorf("%v: code %d, stderr %q", c.args, code, errOut)
+		}
+	}
+}

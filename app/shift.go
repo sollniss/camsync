@@ -76,7 +76,8 @@ type Entry struct {
 	Path    string
 	Action  Action
 	Before  *camsync.Stamp // effective timestamp before the change
-	After   *camsync.Stamp // timestamp written; nil when skipped or failed
+	After   *camsync.Stamp // timestamp written; nil when skipped, failed or not changed
+	Fix     *camsync.Fix   // position written by geotag
 	Sidecar string         // sidecar written, or that would be written
 	Reason  string         // why the photo was skipped or failed
 }
@@ -183,8 +184,11 @@ func (out *ChangeResult) run(
 				e.Action = ActionCreate
 				out.Created++
 			}
-			after := ch.NewOriginal
-			e.After = &after
+			if !ch.NewOriginal.T.IsZero() {
+				after := ch.NewOriginal
+				e.After = &after
+			}
+			e.Fix = ch.Fix
 			out.Written++
 		}
 		out.Entries = append(out.Entries, e)

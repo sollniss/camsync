@@ -6,6 +6,7 @@ package testimg
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 
 	"github.com/sollniss/camsync/exif"
 )
@@ -323,7 +324,12 @@ func nikonWorldTimeIFD(bo binary.ByteOrder, tzMinutes int, dst bool) []byte {
 // so the entry's value field is its offset, which is what a GPSInfo pointer
 // holds.
 func GPS(bo binary.ByteOrder, date string, h, m int, sec float64) Entry {
-	return Entry{Tag: exif.TagGPSIFD, Type: 4, Build: func(off int) []byte { return gpsIFD(bo, off, date, h, m, sec) }}
+	return Entry{Tag: exif.TagGPSIFD, Type: 4, Build: func(off int) []byte { return gpsIFD(bo, off, date, h, m, sec, nil) }}
+}
+
+// GPSAt is GPS with a position in signed decimal degrees as well.
+func GPSAt(bo binary.ByteOrder, date string, h, m int, sec, lat, lon float64) Entry {
+	return Entry{Tag: exif.TagGPSIFD, Type: 4, Build: func(off int) []byte { return gpsIFD(bo, off, date, h, m, sec, &[2]float64{lat, lon}) }}
 }
 
 // GPSBlock builds a TIFF block whose first IFD is a GPS IFD, the layout of
@@ -337,31 +343,70 @@ func GPSBlock(bo binary.ByteOrder, date string, h, m int, sec float64) []byte {
 	}
 	_ = binary.Write(&b, bo, uint16(42))
 	_ = binary.Write(&b, bo, uint32(8))
-	b.Write(gpsIFD(bo, 8, date, h, m, sec))
+	b.Write(gpsIFD(bo, 8, date, h, m, sec, nil))
 	return b.Bytes()
 }
 
-// gpsIFD builds a GPS IFD holding GPSTimeStamp and GPSDateStamp that starts
-// at the absolute TIFF offset off, with its values right behind it.
-func gpsIFD(bo binary.ByteOrder, off int, date string, h, m int, sec float64) []byte {
-	var b bytes.Buffer
-	put := func(v any) { _ = binary.Write(&b, bo, v) }
-	dataOff := off + 2 + 2*12 + 4
-	put(uint16(2))
-	put(uint16(exif.TagGPSTimeStamp))
-	put(uint16(5)) // RATIONAL
-	put(uint32(3))
-	put(uint32(dataOff))
-	put(uint16(exif.TagGPSDateStamp))
-	put(uint16(2)) // ASCII
-	put(uint32(len(date) + 1))
-	put(uint32(dataOff + 24))
-	put(uint32(0)) // next IFD
-	for _, r := range [][2]uint32{{uint32(h), 1}, {uint32(m), 1}, {uint32(sec * 1000), 1000}} {
-		put(r[0])
-		put(r[1])
+// gpsIFD builds a GPS IFD holding GPSTimeStamp, GPSDateStamp and, if pos is
+// set, the coordinates. It starts at the absolute TIFF offset off, with its
+// values right behind it.
+func gpsIFD(bo binary.ByteOrder, off int, date string, h, m int, sec float64, pos *[2]float64) []byte {
+	type entry struct {
+		tag, typ uint16
+		count    int
+		data     []byte
 	}
-	b.WriteString(date)
-	b.WriteByte(0)
+	rationals := func(vs ...[2]uint32) []byte {
+		var b bytes.Buffer
+		for _, v := range vs {
+			_ = binary.Write(&b, bo, v[0])
+			_ = binary.Write(&b, bo, v[1])
+		}
+		return b.Bytes()
+	}
+	dms := func(deg float64) []byte {
+		// Whole ten-thousandths of a second, split without float rounding.
+		t := int64(math.Round(math.Abs(deg) * 3600 * 10000))
+		d, m, s := t/(3600*10000), t/(60*10000)%60, t%(60*10000)
+		return rationals([2]uint32{uint32(d), 1}, [2]uint32{uint32(m), 1}, [2]uint32{uint32(s), 10000})
+	}
+	var entries []entry
+	if pos != nil {
+		latRef, lonRef := "N", "E"
+		if pos[0] < 0 {
+			latRef = "S"
+		}
+		if pos[1] < 0 {
+			lonRef = "W"
+		}
+		entries = append(entries,
+			entry{1, 2, 2, []byte(latRef + "\x00")},
+			entry{exif.TagGPSLatitude, 5, 3, dms(pos[0])},
+			entry{3, 2, 2, []byte(lonRef + "\x00")},
+			entry{exif.TagGPSLongitude, 5, 3, dms(pos[1])})
+	}
+	entries = append(entries,
+		entry{exif.TagGPSTimeStamp, 5, 3, rationals([2]uint32{uint32(h), 1}, [2]uint32{uint32(m), 1}, [2]uint32{uint32(sec * 1000), 1000})},
+		entry{exif.TagGPSDateStamp, 2, len(date) + 1, append([]byte(date), 0)})
+
+	var b, data bytes.Buffer
+	put := func(v any) { _ = binary.Write(&b, bo, v) }
+	dataOff := off + 2 + len(entries)*12 + 4
+	put(uint16(len(entries)))
+	for _, e := range entries {
+		put(e.tag)
+		put(e.typ)
+		put(uint32(e.count))
+		if len(e.data) <= 4 {
+			v := make([]byte, 4)
+			copy(v, e.data)
+			b.Write(v)
+		} else {
+			put(uint32(dataOff + data.Len()))
+			data.Write(e.data)
+		}
+	}
+	put(uint32(0)) // next IFD
+	b.Write(data.Bytes())
 	return b.Bytes()
 }

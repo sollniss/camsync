@@ -78,8 +78,10 @@ func (rt *runtime) resetCommand() *cobra.Command {
 		Use:   "reset [DIR]",
 		Short: "Restore the timestamps recorded in the image files",
 		Long: `Reset writes the timestamps found in the image files back into the
-sidecars of every photo taken with --camera, undoing all shifts. Sidecars are
-kept, since they may hold other data.`,
+sidecars of every photo taken with --camera, undoing all shifts and
+localize, and removes the locations geotag estimated. Locations from the
+image or from other tools are kept. Sidecars are kept, since they may hold
+other data.`,
 		Example:           `  camsync reset --camera sony ~/Photos/trip`,
 		Args:              dirArgs,
 		ValidArgsFunction: completeDirs,

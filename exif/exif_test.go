@@ -207,3 +207,23 @@ func TestGPS(t *testing.T) {
 		t.Errorf("cr3: %v %v", tags, err)
 	}
 }
+
+func TestGPSPosition(t *testing.T) {
+	for _, c := range []struct {
+		lat, lon         float64
+		wantLat, wantLon string
+	}{
+		{54.4250, 13.4350, "54.4250000", "13.4350000"},
+		{-33.8568, -151.2153, "-33.8568000", "-151.2153000"},
+		{0, 0, "", ""}, // no fix
+	} {
+		ifd := append([]testimg.Entry{testimg.GPSAt(binary.BigEndian, "2017:08:10", 9, 0, 0, c.lat, c.lon)}, ifd0...)
+		tags, _, err := exif.ReadFile(writeTemp(t, "pos.jpg", testimg.JPEG(testimg.BuildTIFF(binary.BigEndian, ifd, exifIFD))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tags[exif.TagGPSLatitude] != c.wantLat || tags[exif.TagGPSLongitude] != c.wantLon || tags[exif.TagGPSTimeStamp] != "09:00:00" {
+			t.Errorf("%v,%v: tags = %v", c.lat, c.lon, tags)
+		}
+	}
+}

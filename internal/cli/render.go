@@ -77,8 +77,32 @@ type entryView struct {
 	Action  app.Action     `json:"action"`
 	Before  *camsync.Stamp `json:"before"`
 	After   *camsync.Stamp `json:"after"`
+	Fix     *fixView       `json:"position,omitempty"`
 	Sidecar string         `json:"sidecar"`
 	Reason  string         `json:"reason,omitempty"`
+}
+
+type fixView struct {
+	Lat          float64 `json:"lat"`
+	Lon          float64 `json:"lon"`
+	Gap          string  `json:"gap"`
+	Interpolated bool    `json:"interpolated"`
+	From         string  `json:"from"`
+	To           string  `json:"to,omitempty"`
+}
+
+func entryJSON(e app.Entry) entryView {
+	v := entryView{Path: e.Path, Action: e.Action, Before: e.Before, After: e.After, Sidecar: e.Sidecar, Reason: e.Reason}
+	if f := e.Fix; f != nil {
+		v.Fix = &fixView{Lat: f.Lat, Lon: f.Lon, Gap: gapText(f.Gap), Interpolated: f.Interpolated}
+		if f.From != nil {
+			v.Fix.From = f.From.Path
+		}
+		if f.To != nil {
+			v.Fix.To = f.To.Path
+		}
+	}
+	return v
 }
 
 type changeJSON struct {
@@ -99,7 +123,7 @@ func changeView(res *app.ChangeResult) changeJSON {
 		Entries: []entryView{}, Written: res.Written, Created: res.Created, Skipped: res.Skipped, Failed: res.Failed,
 	}
 	for _, e := range res.Entries {
-		v.Entries = append(v.Entries, entryView{Path: e.Path, Action: e.Action, Before: e.Before, After: e.After, Sidecar: e.Sidecar, Reason: e.Reason})
+		v.Entries = append(v.Entries, entryJSON(e))
 	}
 	return v
 }
@@ -164,6 +188,10 @@ func printEntry(w io.Writer, e app.Entry) {
 	case app.ActionFail:
 		fmt.Fprintf(w, "FAILED  %s: %s\n", e.Path, e.Reason)
 	default:
+		if e.Fix != nil {
+			fmt.Fprintf(w, "%-7s %s: %s  (%s)\n", e.Action, e.Path, e.Fix, filepath.Base(e.Sidecar))
+			return
+		}
 		fmt.Fprintf(w, "%-7s %s: %s -> %s  (%s)\n", e.Action, e.Path, stampText(e.Before), stampText(e.After), filepath.Base(e.Sidecar))
 	}
 }
@@ -383,11 +411,30 @@ func localizeView(res *app.LocalizeResult) localizeJSON {
 			Written: c.Written, Created: c.Created, Skipped: c.Skipped, Failed: c.Failed, Entries: []entryView{},
 		}
 		for _, e := range c.Entries {
-			cv.Entries = append(cv.Entries, entryView{Path: e.Path, Action: e.Action, Before: e.Before, After: e.After, Sidecar: e.Sidecar, Reason: e.Reason})
+			cv.Entries = append(cv.Entries, entryJSON(e))
 		}
 		v.Cameras = append(v.Cameras, cv)
 	}
 	return v
+}
+
+// printSkipReasons prints how many photos of a camera were skipped or failed
+// for each reason, in order of first appearance.
+func printSkipReasons(w io.Writer, res app.ChangeResult) {
+	reasons := map[string]int{}
+	var order []string
+	for _, e := range res.Entries {
+		if e.Action != app.ActionSkip && e.Action != app.ActionFail {
+			continue
+		}
+		if reasons[e.Reason] == 0 {
+			order = append(order, e.Reason)
+		}
+		reasons[e.Reason]++
+	}
+	for _, r := range order {
+		fmt.Fprintf(w, "%s: %d %s\n", res.Camera, reasons[r], r)
+	}
 }
 
 // printLocalize renders one row per camera, the reasons photos were skipped
@@ -410,20 +457,7 @@ func printLocalize(w io.Writer, res *app.LocalizeResult, verbose bool) error {
 	}
 	if !verbose {
 		for _, c := range res.Cameras {
-			reasons := map[string]int{}
-			var order []string
-			for _, e := range c.Entries {
-				if e.Action != app.ActionSkip && e.Action != app.ActionFail {
-					continue
-				}
-				if reasons[e.Reason] == 0 {
-					order = append(order, e.Reason)
-				}
-				reasons[e.Reason]++
-			}
-			for _, r := range order {
-				fmt.Fprintf(w, "%s: %d %s\n", c.Camera, reasons[r], r)
-			}
+			printSkipReasons(w, c.ChangeResult)
 		}
 	}
 	prefix := ""

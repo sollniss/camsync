@@ -22,6 +22,7 @@ camsync list     [DIR] [-v] [-r] [-o table|json]
 camsync suggest  [DIR] [--reference NAME]... [--clock-zone NAME=ZONE]... [--max-offset DURATION]
 camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
 camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
+camsync geotag   [DIR] [--camera NAME] [--max-gap DURATION] [--max-bridge DURATION] [--dry-run] [-v]
 camsync reset    [DIR] --camera NAME [--dry-run]
 ```
 
@@ -49,10 +50,13 @@ camsync reset    [DIR] --camera NAME [--dry-run]
    shifts by one minute. `list` shows the offset currently applied.
 
 4. Optionally rewrite all photos in the local time of the trip with
-   `localize` (see [Local time](#local-time)).
+   `localize` (see [Local time](#local-time)), and give photos without a
+   location the one of photos taken at the same time with `geotag` (see
+   [Locations](#locations)).
 
 5. Undo everything for a camera with `reset`, which writes the timestamps
-   from the image files back into the sidecars.
+   from the image files back into the sidecars and removes the locations
+   `geotag` wrote.
 
 Durations: `2m30s`, `-45s`, `1h`, `+1d2h`. A leading sign applies to the whole
 value. `--timezone +02:00` (or `--tz`) stamps a zone on the written dates (see Timezones). Add
@@ -156,6 +160,48 @@ together with any shift. `list` keeps showing only the shift for photos whose
 image records a zone; for a zone-less image it cannot tell a zone change
 from a shift, so a UTC camera localized to +02:00 shows `+2h`.
 
+### Locations
+
+`geotag` gives photos without a location the location of photos taken at
+about the same time that have one, usually from a phone:
+
+```
+$ camsync geotag --dry-run ~/Photos/2017-rügen
+CAMERA                FILES  LOCATED  WRITTEN  INTERPOLATED  SKIPPED  MEDIAN GAP  MAX GAP
+Canon PowerShot G9 X  367    0        180      116           187      1m27s       13m8s
+HTC Desire 500        343    169      28       18            315      3m49s       7m21s
+Sony F3111            101    0        50       28            51       1m48s       7m
+Canon PowerShot G9 X: 187 no located photo within 15m
+HTC Desire 500: 146 no located photo within 15m
+HTC Desire 500: 169 has a location
+Sony F3111: 51 no located photo within 15m
+
+dry run: 258 sidecars written (0 new), 553 skipped (169 located, 0 already geotagged), 0 failed; positions from 169 located photos
+```
+
+The located photos of each camera form a path. A photo between two photos
+of one path gets the position on the line between them, by time, when both
+are within `--max-gap` (default 5m), or both within `--max-bridge` (default
+15m) and no more than 1 km apart: whoever photographed the same square twice
+in a quarter of an hour was there in between. Otherwise the nearest located
+photo within `--max-gap` is copied. No position is ever made up between the
+photos of two different cameras, which may have been in different places.
+When several cameras could place a photo, the estimate reaching least far in
+time wins. MEDIAN GAP and MAX GAP show how far the written estimates reach;
+`-v` lists every photo with the photos its position comes from.
+
+A located photo's moment is its GPS time; every other photo's moment comes
+from its camera's clock and clock zone, as for `localize`. Run `suggest` and
+`shift` first, since a clock that is ten minutes off puts photos ten minutes
+of walking away.
+
+Positions are written as `exif:GPSLatitude` and `exif:GPSLongitude` with
+`exif:GPSProcessingMethod` set to `camsync`. Photos with a location of their
+own, from the image or from a sidecar written by another tool, are never
+touched, and estimates are never used to place other photos. Running
+`geotag` again updates estimates when the evidence changed, and `reset`
+removes them while keeping locations from anywhere else.
+
 ### Output for scripts
 
 `--output json` (`-o json`) prints the same information as a JSON document
@@ -210,7 +256,8 @@ The sidecar receives the shifted time as `exif:DateTimeOriginal`,
 `exif:DateTimeDigitized` (if the source has one), `xmp:CreateDate` and
 `photoshop:DateCreated`. New sidecars also get `tiff:Make` and `tiff:Model`.
 Fractional seconds and the UTC offset (`OffsetTimeOriginal`) of the original
-are preserved.
+are preserved. `geotag` writes `exif:GPSLatitude`, `exif:GPSLongitude` and
+`exif:GPSProcessingMethod` instead (see [Locations](#locations)).
 
 Timestamps are read from the sidecar first and from the image file only when
 the sidecar has none. The camera name comes from the sidecar's `tiff:Make` and

@@ -12,9 +12,14 @@ import (
 
 // Change is a planned sidecar update for one photo.
 type Change struct {
-	Photo       *Photo
-	Fields      xmp.Fields // what will be written or replaced in the sidecar
-	NewOriginal Stamp      // the timestamp the photo will have afterwards
+	Photo  *Photo
+	Fields xmp.Fields  // what will be written or replaced in the sidecar
+	Remove []xmp.Field // what will be removed from an existing sidecar
+	// NewOriginal is the timestamp the photo will have afterwards; zero when
+	// the change leaves the timestamps alone.
+	NewOriginal Stamp
+	// Fix is the position written by a geotag change.
+	Fix *Fix
 }
 
 // Shift describes how to move a photo's timestamps.
@@ -52,7 +57,9 @@ func PlanShift(p *Photo, s Shift) (*Change, error) {
 	return newChange(p, orig, dig), nil
 }
 
-// PlanReset plans restoring the timestamps recorded in the image file.
+// PlanReset plans restoring the timestamps recorded in the image file and
+// removing a position camsync estimated (see PlanGeotag). Positions from the
+// image or written by other tools are kept.
 func PlanReset(p *Photo) (*Change, error) {
 	if p.Err != nil {
 		return nil, p.Err
@@ -60,10 +67,17 @@ func PlanReset(p *Photo) (*Change, error) {
 	if p.Sidecar == "" {
 		return nil, errors.New("no sidecar, nothing to reset")
 	}
-	if p.FileOriginal == nil {
+	ch := &Change{Photo: p, Fields: xmp.Fields{}}
+	switch {
+	case p.FileOriginal != nil:
+		ch = newChange(p, *p.FileOriginal, p.FileDigitized)
+	case !p.PositionEstimated:
 		return nil, errors.New("image file has no timestamp to restore")
 	}
-	return newChange(p, *p.FileOriginal, p.FileDigitized), nil
+	if p.PositionEstimated {
+		ch.Remove = geotagFields
+	}
+	return ch, nil
 }
 
 func newChange(p *Photo, orig Stamp, dig *Stamp) *Change {
@@ -75,15 +89,22 @@ func newChange(p *Photo, orig Stamp, dig *Stamp) *Change {
 	if dig != nil {
 		fields[xmp.DateTimeDigitized] = dig.XMP()
 	}
-	if p.Sidecar == "" {
-		if p.Make != "" {
-			fields[xmp.Make] = p.Make
-		}
-		if p.Model != "" {
-			fields[xmp.Model] = p.Model
-		}
-	}
+	addCameraFields(p, fields)
 	return &Change{Photo: p, Fields: fields, NewOriginal: orig}
+}
+
+// addCameraFields adds Make and Model for a sidecar that does not exist yet,
+// so it names the camera on its own.
+func addCameraFields(p *Photo, fields xmp.Fields) {
+	if p.Sidecar != "" {
+		return
+	}
+	if p.Make != "" {
+		fields[xmp.Make] = p.Make
+	}
+	if p.Model != "" {
+		fields[xmp.Model] = p.Model
+	}
 }
 
 // Write applies the change to the photo's sidecar, updating an existing
@@ -106,7 +127,7 @@ func (c *Change) Write(dryRun bool) (created bool, err error) {
 			}
 			data = d
 		}
-		if out, err = xmp.Rewrite(data, c.Fields); err != nil {
+		if out, err = xmp.Update(data, c.Fields, c.Remove); err != nil {
 			return false, fmt.Errorf("sidecar %s: %w", p.Sidecar, err)
 		}
 	} else {

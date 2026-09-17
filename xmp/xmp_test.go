@@ -194,3 +194,36 @@ func TestRewriteStrayEndTag(t *testing.T) {
 		t.Error("expected error for stray closing tag")
 	}
 }
+
+func TestUpdateRemoves(t *testing.T) {
+	lat := Field{NSExif, "GPSLatitude"}
+	lon := Field{NSExif, "GPSLongitude"}
+	method := Field{NSExif, "GPSProcessingMethod"}
+	withGPS, err := Rewrite([]byte(exiftoolXMP), Fields{lat: "54,25.5N", lon: "13,26.1E", method: "camsync"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Attribute form, as Lightroom writes it.
+	attrs := strings.Replace(lightroomXMP, `tiff:Make="Canon"`, `tiff:Make="Canon" exif:GPSLatitude="54,25.5N"`, 1)
+	for name, doc := range map[string]string{"elements": string(withGPS), "attributes": attrs} {
+		out, err := Update([]byte(doc), Fields{DateTimeOriginal: "2024-05-01T12:00:00"}, []Field{lat, lon, method, Make})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		f, err := Read(out)
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, out)
+		}
+		if _, ok := f[lat]; ok || f[lon] != "" || f[method] != "" || f[Make] != "" || f[DateTimeOriginal] != "2024-05-01T12:00:00" {
+			t.Errorf("%s: fields = %v\n%s", name, f, out)
+		}
+		if name == "elements" && !strings.Contains(string(out), "<ex:ISOSpeedRatings><rdf:Seq><rdf:li>100</rdf:li></rdf:Seq></ex:ISOSpeedRatings>") {
+			t.Errorf("unrelated content lost:\n%s", out)
+		}
+	}
+	// Set wins over remove.
+	out, _ := Update([]byte(exiftoolXMP), Fields{Model: "X"}, []Field{Model})
+	if f, _ := Read(out); f[Model] != "X" {
+		t.Errorf("set and removed: %v", f)
+	}
+}

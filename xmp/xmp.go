@@ -44,6 +44,13 @@ var (
 	Make              = Field{NSTIFF, "Make"}
 	Model             = Field{NSTIFF, "Model"}
 
+	// GPS coordinates in the XMP form "DDD,MM.mmmmk", k being N, S, E or W.
+	GPSLatitude  = Field{NSExif, "GPSLatitude"}
+	GPSLongitude = Field{NSExif, "GPSLongitude"}
+	// GPSProcessingMethod names how a position was found; camsync marks
+	// its estimates with it.
+	GPSProcessingMethod = Field{NSExif, "GPSProcessingMethod"}
+
 	rdfRDF         = Field{NSRDF, "RDF"}
 	rdfDescription = Field{NSRDF, "Description"}
 )
@@ -188,13 +195,24 @@ func Read(data []byte) (Fields, error) {
 // content (see the package comment for how the output is serialised).
 // Fields already present (as attribute or element) are replaced in place;
 // missing ones are added in a new rdf:Description at the end of rdf:RDF.
-func Rewrite(data []byte, set Fields) ([]byte, error) {
+func Rewrite(data []byte, set Fields) ([]byte, error) { return Update(data, set, nil) }
+
+// Update is Rewrite that also removes the properties listed in remove from
+// every rdf:Description, whether written as attribute or as element. A field
+// both set and removed is set.
+func Update(data []byte, set Fields, remove []Field) ([]byte, error) {
 	bom := bytes.HasPrefix(data, utf8BOM)
 	toks, err := tokenize(bytes.TrimPrefix(data, utf8BOM))
 	if err != nil {
 		return nil, err
 	}
 	remaining := maps.Clone(set)
+	removing := map[Field]bool{}
+	for _, f := range remove {
+		if _, ok := set[f]; !ok {
+			removing[f] = true
+		}
+	}
 	var out bytes.Buffer
 	if bom {
 		out.Write(utf8BOM)
@@ -204,12 +222,28 @@ func Rewrite(data []byte, set Fields) ([]byte, error) {
 	var capture *Field
 	depth, nested := 0, false
 	skipEnd := false
+	skip := 0 // depth inside a removed element
 	for i, t := range toks {
+		if skip > 0 {
+			switch t.(type) {
+			case xml.StartElement, xml.EndElement:
+			default:
+				continue // content of a removed element
+			}
+		}
 		switch t := t.(type) {
 		case xml.StartElement:
 			s := tr.push(t)
 			name := s.element(t.Name)
+			parent := Field{}
+			if len(names) > 0 {
+				parent = names[len(names)-1]
+			}
 			names = append(names, name)
+			if skip > 0 || (capture == nil && parent == rdfDescription && removing[name]) {
+				skip++
+				continue
+			}
 			if capture != nil {
 				depth++
 				nested = true
@@ -219,15 +253,18 @@ func Rewrite(data []byte, set Fields) ([]byte, error) {
 			capturing := false
 			switch name {
 			case rdfDescription:
-				attrs := make([]xml.Attr, len(t.Attr))
-				copy(attrs, t.Attr)
-				for j, a := range attrs {
+				attrs := make([]xml.Attr, 0, len(t.Attr))
+				for _, a := range t.Attr {
 					if f, ok := s.attribute(a.Name); ok {
+						if removing[f] {
+							continue
+						}
 						if v, ok := remaining[f]; ok {
-							attrs[j].Value = v
+							a.Value = v
 							delete(remaining, f)
 						}
 					}
+					attrs = append(attrs, a)
 				}
 				t.Attr = attrs
 			default:
@@ -254,6 +291,10 @@ func Rewrite(data []byte, set Fields) ([]byte, error) {
 			name := names[len(names)-1]
 			names = names[:len(names)-1]
 			tr.pop()
+			if skip > 0 {
+				skip--
+				continue
+			}
 			if capture != nil {
 				if depth > 0 {
 					depth--

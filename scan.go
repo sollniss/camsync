@@ -122,6 +122,12 @@ type Photo struct {
 	// whether the camera clock is right.
 	GPSTime *time.Time
 
+	// Position is where the photo was taken: from the sidecar when it has
+	// one, else from the image. PositionEstimated marks a position camsync
+	// wrote to the sidecar (see PlanGeotag) rather than a measured one.
+	Position          *Position
+	PositionEstimated bool
+
 	Sidecar       string // existing sidecar path, "" if none
 	SidecarTarget string // where a sidecar will be written
 	Err           error  // problem that prevents shifting this photo
@@ -216,6 +222,9 @@ func loadPhoto(path, target, sidecar string) *Photo {
 	if gps, ok := ParseGPSTime(tags[exif.TagGPSDateStamp], tags[exif.TagGPSTimeStamp]); ok {
 		p.GPSTime = &gps
 	}
+	if pos, ok := parseDecimalPosition(tags[exif.TagGPSLatitude], tags[exif.TagGPSLongitude]); ok {
+		p.Position = &pos
+	}
 
 	if sc := sidecar; sc != "" {
 		p.Sidecar, p.SidecarTarget = sc, sc
@@ -242,6 +251,10 @@ func loadPhoto(path, target, sidecar string) *Photo {
 		}
 		if s, ok := ParseXMPStamp(fields[xmp.DateTimeDigitized]); ok {
 			p.Digitized = &s
+		}
+		if pos, ok := ParseXMPPosition(fields[xmp.GPSLatitude], fields[xmp.GPSLongitude]); ok {
+			p.Position = &pos
+			p.PositionEstimated = strings.TrimSpace(fields[xmp.GPSProcessingMethod]) == GeotagMethod
 		}
 	}
 	p.Camera = CameraName(p.Make, p.Model)
