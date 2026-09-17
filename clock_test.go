@@ -153,60 +153,75 @@ func TestIsPhone(t *testing.T) {
 	}
 }
 
+// zonedGroup builds a group whose photos show the given UTC instants on a
+// clock running in zone clock, off by err, recording tz ("" for none).
+func zonedGroup(mk, model string, instants []time.Time, clock, err time.Duration, tz string) *Group {
+	g := &Group{Camera: CameraName(mk, model)}
+	for _, at := range instants {
+		g.Photos = append(g.Photos, photoAt(mk, model, at.Add(clock+err), tz, nil))
+	}
+	return g
+}
+
 func TestEstimateClocks(t *testing.T) {
 	rng := rand.New(rand.NewPCG(5, 6))
 	ref, cam := simulateTrip(rng, 3, 0.8, 0.7)
-	group := func(mk, model string, ts []time.Time) *Group {
-		g := &Group{Camera: CameraName(mk, model)}
-		for _, at := range ts {
-			g.Photos = append(g.Photos, photoAt(mk, model, at, "", nil))
-		}
-		return g
-	}
-	phone := group("Apple", "iPhone 15", ref)
-	behind := group("Canon", "Canon EOS R5", shifted(cam, -10*time.Minute))
+	const local = 2 * time.Hour
+	phone := zonedGroup("Apple", "iPhone 15", ref, local, 0, "+02:00")
+	// Local time without a zone, ten minutes behind.
+	behind := zonedGroup("Canon", "Canon EOS R5", cam, local, -10*time.Minute, "")
 
 	// A camera with GPS and a known zone that runs 90 seconds fast.
 	gpsCam := &Group{Camera: "Nikon Z 6"}
 	for _, at := range cam[:5] {
-		utc := at.Add(-2 * time.Hour)
-		gpsCam.Photos = append(gpsCam.Photos, photoAt("Nikon", "Z 6", at.Add(90*time.Second), "+02:00", &utc))
+		utc := at
+		gpsCam.Photos = append(gpsCam.Photos, photoAt("Nikon", "Z 6", at.Add(local+90*time.Second), "+02:00", &utc))
 	}
 	// A GPS camera without zone but with a good clock is a reference.
 	goodGPS := &Group{Camera: "GoPro"}
-	utc := ref[0].Add(-9 * time.Hour)
-	goodGPS.Photos = append(goodGPS.Photos, photoAt("GoPro", "HERO12", ref[0].Add(5*time.Second), "", &utc))
+	utc := ref[0]
+	goodGPS.Photos = append(goodGPS.Photos, photoAt("GoPro", "HERO12", ref[0].Add(local+5*time.Second), "", &utc))
 	undated := &Group{Camera: "Scanner", Photos: []*Photo{{Camera: "Scanner"}}}
 
 	groups := []*Group{behind, goodGPS, gpsCam, phone, undated}
-	est := EstimateClocks(groups, ClockOptions{})
-	if e := est[0]; !e.Found || e.Reference || e.Basis != BasisActivity || (e.Offset-10*time.Minute).Abs() > 3*time.Minute {
+	clocks := EstimateClocks(groups, ClockOptions{})
+	est := clocks.Cameras
+	if clocks.WallClocks || clocks.Timeline.Len() != len(ref) {
+		t.Errorf("wall clocks %v, timeline %d", clocks.WallClocks, clocks.Timeline.Len())
+	}
+	if e := est[0]; !e.Found || e.Reference || e.Basis != BasisActivity || (e.Offset-10*time.Minute).Abs() > 3*time.Minute ||
+		e.ClockZone != (ClockZone{local, ZoneFromActivity}) {
 		t.Errorf("behind = %+v", e)
 	}
-	if e := est[1]; !e.Reference || e.Basis != BasisGPS || e.GPS == nil || !e.GPS.ZoneInferred {
+	if e := est[1]; !e.Reference || e.Basis != BasisGPS || e.GPS == nil || !e.GPS.ZoneInferred || e.ClockZone != (ClockZone{local, ZoneFromGPS}) {
 		t.Errorf("good GPS = %+v", e)
 	}
-	if e := est[2]; !e.Found || e.Basis != BasisGPS || e.Offset != -90*time.Second || e.Matched != 5 || e.Confidence != ConfidenceHigh {
+	if e := est[2]; !e.Found || e.Basis != BasisGPS || e.Offset != -90*time.Second || e.Matched != 5 || e.Confidence != ConfidenceHigh ||
+		e.ClockZone != (ClockZone{local, ZoneFromPhotos}) {
 		t.Errorf("gps camera = %+v", e)
 	}
-	if e := est[3]; !e.Reference || e.Basis != BasisPhone || e.Found {
+	if e := est[3]; !e.Reference || e.Basis != BasisPhone || e.Found || e.ClockZone.Source != ZoneLocal {
 		t.Errorf("phone = %+v", e)
 	}
 	if e := est[4]; e.Found || e.Reference || e.Note != "no timestamps" {
 		t.Errorf("undated = %+v", e)
 	}
+	if clocks.Estimate(phone) != &est[3] || clocks.Estimate(&Group{}) != nil {
+		t.Error("Estimate does not find the groups")
+	}
 
-	// Naming a reference replaces the automatic choice.
-	est = EstimateClocks([]*Group{phone, behind}, ClockOptions{References: []*Group{behind}})
+	// Naming a reference replaces the automatic choice. The zone-less
+	// reference is taken to follow the local zone.
+	est = EstimateClocks([]*Group{phone, behind}, ClockOptions{References: []*Group{behind}}).Cameras
 	if e := est[0]; e.Reference || !e.Found || (e.Offset+10*time.Minute).Abs() > 3*time.Minute {
 		t.Errorf("phone against user reference = %+v", e)
 	}
-	if e := est[1]; !e.Reference || e.Basis != BasisUser {
+	if e := est[1]; !e.Reference || e.Basis != BasisUser || e.ClockZone.Source != ZoneLocal {
 		t.Errorf("user reference = %+v", e)
 	}
 
 	// Without any reference nothing can be estimated.
-	est = EstimateClocks([]*Group{behind}, ClockOptions{})
+	est = EstimateClocks([]*Group{behind}, ClockOptions{}).Cameras
 	if e := est[0]; e.Found || e.Note != "no reference camera" {
 		t.Errorf("no reference = %+v", e)
 	}
@@ -215,37 +230,61 @@ func TestEstimateClocks(t *testing.T) {
 func TestEstimateClocksComparesMomentsInTime(t *testing.T) {
 	rng := rand.New(rand.NewPCG(7, 8))
 	ref, cam := simulateTrip(rng, 3, 0.8, 0.7)
-	// The phone records +02:00 on half its photos only; the other half fall
-	// back to that zone. The camera is on +09:00 home time and 2m30s fast.
+	// The phone records +02:00 on half its photos only; the other half are
+	// placed by the timeline. The camera is on +09:00 and 2m30s fast.
 	phone := &Group{Camera: "HTC Desire 500"}
 	for i, at := range ref {
 		tz := ""
 		if i%2 == 0 {
 			tz = "+02:00"
 		}
-		phone.Photos = append(phone.Photos, photoAt("HTC", "Desire 500", at, tz, nil))
+		phone.Photos = append(phone.Photos, photoAt("HTC", "Desire 500", at.Add(2*time.Hour), tz, nil))
 	}
-	camera := &Group{Camera: "Canon PowerShot G9 X"}
-	for _, at := range cam {
-		camera.Photos = append(camera.Photos, photoAt("Canon", "PowerShot G9 X", at.Add(7*time.Hour+150*time.Second), "+09:00", nil))
-	}
-	est := EstimateClocks([]*Group{camera, phone}, ClockOptions{})
-	if e := est[0]; !e.Found || (e.Offset+150*time.Second).Abs() > 3*time.Minute || e.Zone != "+09:00" {
+	camera := zonedGroup("Canon", "PowerShot G9 X", cam, 9*time.Hour, 150*time.Second, "+09:00")
+	// No zone, clock on UTC and a minute behind.
+	utcCam := zonedGroup("SONY", "ILCE-7M3", cam, 0, -time.Minute, "")
+	est := EstimateClocks([]*Group{camera, phone, utcCam}, ClockOptions{}).Cameras
+	if e := est[0]; !e.Found || (e.Offset+150*time.Second).Abs() > 3*time.Minute || e.ClockZone != (ClockZone{9 * time.Hour, ZoneFromPhotos}) {
 		t.Errorf("camera = %+v", e)
 	}
-	if e := est[1]; !e.Reference || e.Zone != "+02:00" {
+	if e := est[1]; !e.Reference || e.ClockZone.Source != ZoneLocal {
 		t.Errorf("phone = %+v", e)
 	}
+	if e := est[2]; !e.Found || (e.Offset-time.Minute).Abs() > 3*time.Minute || e.ClockZone != (ClockZone{0, ZoneFromActivity}) {
+		t.Errorf("UTC camera = %+v", e)
+	}
 
-	// Without zones on either side, wall clocks are compared.
-	for _, p := range camera.Photos {
-		p.Original.TZ = ""
+	// A clock zone set by the caller wins.
+	est = EstimateClocks([]*Group{camera, phone, utcCam}, ClockOptions{ClockZones: map[*Group]time.Duration{utcCam: time.Hour}}).Cameras
+	if e := est[2]; !e.Found || (e.Offset-time.Hour-time.Minute).Abs() > 3*time.Minute || e.ClockZone != (ClockZone{time.Hour, ZoneFromUser}) {
+		t.Errorf("user clock zone = %+v", e)
 	}
-	for _, p := range phone.Photos {
-		p.Original.TZ = ""
+
+	// Without zones anywhere, wall clocks are compared.
+	for _, g := range []*Group{camera, phone} {
+		for _, p := range g.Photos {
+			p.Original.TZ = ""
+		}
 	}
-	est = EstimateClocks([]*Group{camera, phone}, ClockOptions{MaxOffset: 8 * time.Hour})
-	if e := est[0]; !e.Found || (e.Offset+7*time.Hour+150*time.Second).Abs() > 3*time.Minute || e.Zone != "" {
+	clocks := EstimateClocks([]*Group{camera, phone}, ClockOptions{MaxOffset: 8 * time.Hour})
+	if e := clocks.Cameras[0]; !clocks.WallClocks || !e.Found || (e.Offset+7*time.Hour+150*time.Second).Abs() > 3*time.Minute || e.ClockZone.Known() {
 		t.Errorf("wall clocks: %+v", e)
+	}
+}
+
+func TestNearestZone(t *testing.T) {
+	for _, c := range []struct {
+		d     time.Duration
+		known []time.Duration
+		want  time.Duration
+	}{
+		{2*time.Hour + 3*time.Minute, nil, 2 * time.Hour},
+		{-9*time.Hour + 20*time.Minute, nil, -9 * time.Hour},
+		{5*time.Hour + 40*time.Minute, []time.Duration{5*time.Hour + 30*time.Minute}, 5*time.Hour + 30*time.Minute},
+		{-10 * time.Second, []time.Duration{time.Hour}, 0},
+	} {
+		if got := nearestZone(c.d, c.known); got != c.want {
+			t.Errorf("nearestZone(%v, %v) = %v, want %v", c.d, c.known, got, c.want)
+		}
 	}
 }

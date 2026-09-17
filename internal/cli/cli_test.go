@@ -326,7 +326,7 @@ func TestSuggestFlow(t *testing.T) {
 		t.Fatalf("code %d, stderr %q\n%s", code, errOut, out)
 	}
 	apply := "camsync shift --camera 'Canon EOS R5' --by +10m4s " + shellQuote(dir)
-	for _, want := range []string{"reference", "phone; GPS: clock exact", "estimated  +10m4s  high", "8 photos within 1m of a reference photo", apply} {
+	for _, want := range []string{"reference", "phone; GPS: clock exact", "estimated  +02:00 (guessed)  +10m4s  high", "8 photos within 1m of a reference photo", apply} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
@@ -366,14 +366,14 @@ func TestSuggestFlow(t *testing.T) {
 		t.Fatal(out)
 	}
 	code, out, _ = run(t, "suggest", dir)
-	if code != 0 || !strings.Contains(out, "estimated  none") || strings.Contains(out, "To apply") {
+	if code != 0 || !strings.Contains(out, "estimated  +02:00 (guessed)  none") || strings.Contains(out, "To apply") {
 		t.Errorf("after shift: %d\n%s", code, out)
 	}
 
 	// A named reference replaces the automatic choice, but a camera with GPS
 	// times and a zone is still measured against GPS time.
 	code, out, _ = run(t, "suggest", "--reference", "canon", dir)
-	if code != 0 || !strings.Contains(out, "named with --reference") || !strings.Contains(out, "estimated  none   high        measured against GPS time in 8 photos") {
+	if code != 0 || !strings.Contains(out, "named with --reference") || !strings.Contains(out, "estimated  local       none   high        measured against GPS time in 8 photos") {
 		t.Errorf("user reference: %d\n%s", code, out)
 	}
 }
@@ -402,6 +402,115 @@ func TestShellQuote(t *testing.T) {
 	for in, want := range map[string]string{"sony": "sony", "+10m4s": "+10m4s", "/a/b-c": "/a/b-c", "Canon EOS R5": "'Canon EOS R5'", "it's": `'it'\''s'`} {
 		if got := shellQuote(in); got != want {
 			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// zoneDir writes the same moments, around midnight in Berlin, from a phone
+// recording +02:00, a camera on Japan time and a zone-less camera on UTC.
+func zoneDir(t *testing.T) string {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	start := time.Date(2024, 5, 1, 19, 0, 0, 0, time.UTC) // 21:00 in Berlin
+	for i, gap := range []int{0, 1300, 700, 2900, 400, 3000, 1800, 900} {
+		at := start.Add(time.Duration(i*1800+gap) * time.Second)
+		write := func(name, mk, model string, clock time.Duration, tz string) {
+			exifIFD := []testimg.Entry{testimg.ASCII(exif.TagDateTimeOriginal, at.Add(clock).Format("2006:01:02 15:04:05"))}
+			if tz != "" {
+				exifIFD = append(exifIFD, testimg.ASCII(exif.TagOffsetTimeOriginal, tz))
+			}
+			tiff := testimg.BuildTIFF(binary.LittleEndian, []testimg.Entry{testimg.ASCII(exif.TagMake, mk), testimg.ASCII(exif.TagModel, model)}, exifIFD)
+			mustWrite(t, filepath.Join(dir, fmt.Sprintf("%s_%04d.JPG", name, i)), testimg.JPEG(tiff))
+		}
+		write("IMG", "Apple", "iPhone 15", 2*time.Hour, "+02:00")
+		write("CAN", "Canon", "Canon PowerShot G9 X", 9*time.Hour, "+09:00")
+		write("DSC", "SONY", "ILCE-7M3", 0, "")
+	}
+	return dir
+}
+
+func TestLocalizeFlow(t *testing.T) {
+	dir := zoneDir(t)
+	code, out, errOut := run(t, "localize", "--dry-run", dir)
+	if code != 0 || errOut != "" {
+		t.Fatalf("code %d, stderr %q\n%s", code, errOut, out)
+	}
+	for _, want := range []string{
+		"Apple iPhone 15       8      local             -           0        8        0",
+		"Canon PowerShot G9 X  8      +09:00            +02:00      8        0        5",
+		"SONY ILCE-7M3         8      +00:00 (guessed)  +02:00      8        0        3",
+		"dry run: 16 sidecars written (16 new), 8 skipped (8 already local), 0 failed; local zone from 8 phone photos",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("dry run lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CAN_0000.JPG.xmp")); err == nil {
+		t.Fatal("dry run wrote a sidecar")
+	}
+
+	code, out, _ = run(t, "localize", "-v", "-c", "canon", dir)
+	if code != 0 || !strings.Contains(out, "create  "+filepath.Join(dir, "CAN_0007.JPG")+": 2024-05-02 07:45:00 +09:00 -> 2024-05-02 00:45:00 +02:00") {
+		t.Errorf("canon: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, "localize", "-o", "json", dir)
+	var v struct {
+		Written, Unchanged int
+		Cameras            []struct {
+			Camera     string   `json:"camera"`
+			LocalZones []string `json:"localZones"`
+			ClockZone  *struct {
+				Zone, Source string
+			} `json:"clockZone"`
+		} `json:"cameras"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); code != 0 || err != nil {
+		t.Fatalf("%d %v\n%s", code, err, out)
+	}
+	if v.Written != 8 || v.Unchanged != 16 || v.Cameras[2].ClockZone == nil || v.Cameras[2].ClockZone.Zone != "+00:00" || v.Cameras[2].ClockZone.Source != "activity" {
+		t.Errorf("json = %+v", v)
+	}
+
+	// Localized photos keep their moment: no offset, and suggest agrees.
+	code, out, _ = run(t, "list", dir)
+	if code != 0 || strings.Contains(out, "+7h") || strings.Contains(out, "mixed") {
+		t.Errorf("list after localize: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, "suggest", dir)
+	if code != 0 || strings.Contains(out, "To apply") {
+		t.Errorf("suggest after localize: %d\n%s", code, out)
+	}
+
+	// Without the phone the local zone must be given.
+	for i := range 8 {
+		if err := os.Remove(filepath.Join(dir, fmt.Sprintf("IMG_%04d.JPG", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out, _ = run(t, "reset", "-c", "canon", dir)
+	if code != 0 {
+		t.Fatal(out)
+	}
+	code, out, _ = run(t, "localize", "-n", "-c", "canon", dir)
+	if code != 0 || !strings.Contains(out, "Canon PowerShot G9 X: 8 no local zone known within 1d; set one with --zone") {
+		t.Errorf("no phone: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, "localize", "-n", "-c", "canon", "--zone", "+02:00", dir)
+	if code != 0 || !strings.Contains(out, "8 sidecars written") {
+		t.Errorf("--zone: %d\n%s", code, out)
+	}
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"localize", "--zone", "CEST", dir}, "invalid UTC offset"},
+		{[]string{"localize", "--clock-zone", "sony", dir}, "must have the form CAMERA=ZONE"},
+		{[]string{"localize", "--clock-zone", "nikon=Z", dir}, "no camera matches"},
+		{[]string{"localize", "--max-gap", "0", dir}, "--max-gap must be positive"},
+	} {
+		if code, _, errOut := run(t, c.args...); code != ExitUsage || !strings.Contains(errOut, c.want) {
+			t.Errorf("%v: code %d, stderr %q", c.args, code, errOut)
 		}
 	}
 }

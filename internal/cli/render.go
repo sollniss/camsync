@@ -6,7 +6,6 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"text/tabwriter"
 
@@ -192,29 +191,59 @@ type gpsView struct {
 	ZoneInferred bool   `json:"zoneInferred"`
 }
 
+type clockZoneView struct {
+	Zone   string `json:"zone,omitempty"`
+	Source string `json:"source"`
+}
+
 type suggestionView struct {
-	Index      int      `json:"index"`
-	Camera     string   `json:"camera"`
-	Files      int      `json:"files"`
-	Reference  bool     `json:"reference"`
-	Basis      string   `json:"basis,omitempty"`
-	Shift      *string  `json:"shift"`
-	Confidence string   `json:"confidence,omitempty"`
-	Matched    int      `json:"matched"`
-	GPS        *gpsView `json:"gps"`
-	Note       string   `json:"note,omitempty"`
+	Index      int            `json:"index"`
+	Camera     string         `json:"camera"`
+	Files      int            `json:"files"`
+	Reference  bool           `json:"reference"`
+	Basis      string         `json:"basis,omitempty"`
+	ClockZone  *clockZoneView `json:"clockZone"`
+	Shift      *string        `json:"shift"`
+	Confidence string         `json:"confidence,omitempty"`
+	Matched    int            `json:"matched"`
+	GPS        *gpsView       `json:"gps"`
+	Note       string         `json:"note,omitempty"`
 }
 
 type suggestJSON struct {
-	MaxOffset string           `json:"maxOffset"`
-	Cameras   []suggestionView `json:"cameras"`
+	MaxOffset  string           `json:"maxOffset"`
+	WallClocks bool             `json:"wallClocks"`
+	Cameras    []suggestionView `json:"cameras"`
+}
+
+func clockZoneJSON(z camsync.ClockZone) *clockZoneView {
+	switch z.Source {
+	case "":
+		return nil
+	case camsync.ZoneLocal:
+		return &clockZoneView{Source: string(z.Source)}
+	}
+	return &clockZoneView{Zone: camsync.FormatZone(z.Zone), Source: string(z.Source)}
+}
+
+// clockZoneText renders a clock zone for tables, marking guesses.
+func clockZoneText(z camsync.ClockZone) string {
+	switch z.Source {
+	case "":
+		return "-"
+	case camsync.ZoneFromActivity:
+		return z.String() + " (guessed)"
+	case camsync.ZoneFromGPS:
+		return z.String() + " (GPS)"
+	}
+	return z.String()
 }
 
 func suggestView(res *app.SuggestResult) suggestJSON {
-	v := suggestJSON{MaxOffset: camsync.FormatDuration(res.MaxOffset), Cameras: []suggestionView{}}
+	v := suggestJSON{MaxOffset: camsync.FormatDuration(res.MaxOffset), WallClocks: res.WallClocks, Cameras: []suggestionView{}}
 	for _, c := range res.Cameras {
 		sv := suggestionView{
-			Index: c.Index, Camera: c.Name, Files: c.Files, Reference: c.Reference, Basis: string(c.Basis),
+			Index: c.Index, Camera: c.Name, Files: c.Files, Reference: c.Reference, Basis: string(c.Basis), ClockZone: clockZoneJSON(c.ClockZone),
 			Confidence: string(c.Confidence), Matched: c.Matched, Note: c.Note,
 		}
 		if c.Found {
@@ -233,35 +262,24 @@ func suggestView(res *app.SuggestResult) suggestJSON {
 // that apply the estimates. shiftArgs are appended to every command.
 func printSuggest(w io.Writer, res *app.SuggestResult, shiftArgs []string) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "#\tCAMERA\tFILES\tCLOCK\tSHIFT\tCONFIDENCE\tNOTES")
+	fmt.Fprintln(tw, "#\tCAMERA\tFILES\tCLOCK\tCLOCK ZONE\tSHIFT\tCONFIDENCE\tNOTES")
 	references := 0
-	var refZones []string
-	for _, c := range res.Cameras {
-		if c.Reference {
-			references++
-			if c.Zone != "" && !slices.Contains(refZones, c.Zone) {
-				refZones = append(refZones, c.Zone)
-			}
-		}
-	}
 	for _, c := range res.Cameras {
 		clock, shift, conf := "unknown", "-", "-"
 		switch {
 		case c.Reference:
 			clock = "reference"
+			references++
 		case c.Found:
 			clock, shift, conf = "estimated", camsync.FormatDuration(c.Offset), string(c.Confidence)
 		}
-		notes := suggestNotes(c)
-		if !c.Reference && c.Zone != "" && len(refZones) > 0 && !slices.Contains(refZones, c.Zone) {
-			// Worth a look: either the camera was left on another zone, which
-			// is fine, or its zone setting is wrong and needs --timezone.
-			notes = strings.TrimPrefix(notes+"; zone "+c.Zone+", references "+strings.Join(refZones, ", "), "; ")
-		}
-		fmt.Fprintf(tw, "%d\t%s\t%d\t%s\t%s\t%s\t%s\n", c.Index, c.Name, c.Files, clock, shift, conf, notes)
+		fmt.Fprintf(tw, "%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n", c.Index, c.Name, c.Files, clock, clockZoneText(c.ClockZone), shift, conf, suggestNotes(c))
 	}
 	if err := tw.Flush(); err != nil {
 		return err
+	}
+	if res.WallClocks {
+		fmt.Fprintln(w, "\nNo photo records a time zone; wall clocks were compared.")
 	}
 
 	if references == 0 {
@@ -329,4 +347,90 @@ func shellQuote(s string) string {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+type localizedCameraView struct {
+	Camera     string         `json:"camera"`
+	ClockZone  *clockZoneView `json:"clockZone"`
+	LocalZones []string       `json:"localZones"`
+	DayChanges int            `json:"dayChanges"`
+	Written    int            `json:"written"`
+	Created    int            `json:"created"`
+	Skipped    int            `json:"skipped"`
+	Failed     int            `json:"failed"`
+	Entries    []entryView    `json:"entries"`
+}
+
+type localizeJSON struct {
+	DryRun    bool                  `json:"dryRun"`
+	Evidence  int                   `json:"evidence"`
+	Cameras   []localizedCameraView `json:"cameras"`
+	Written   int                   `json:"written"`
+	Created   int                   `json:"created"`
+	Skipped   int                   `json:"skipped"`
+	Unchanged int                   `json:"unchanged"`
+	Failed    int                   `json:"failed"`
+}
+
+func localizeView(res *app.LocalizeResult) localizeJSON {
+	v := localizeJSON{
+		DryRun: res.DryRun, Evidence: res.Evidence, Cameras: []localizedCameraView{},
+		Written: res.Written, Created: res.Created, Skipped: res.Skipped, Unchanged: res.Unchanged, Failed: res.Failed,
+	}
+	for _, c := range res.Cameras {
+		cv := localizedCameraView{
+			Camera: c.Camera, ClockZone: clockZoneJSON(c.ClockZone), LocalZones: append([]string{}, c.LocalZones...), DayChanges: c.DayChanges,
+			Written: c.Written, Created: c.Created, Skipped: c.Skipped, Failed: c.Failed, Entries: []entryView{},
+		}
+		for _, e := range c.Entries {
+			cv.Entries = append(cv.Entries, entryView{Path: e.Path, Action: e.Action, Before: e.Before, After: e.After, Sidecar: e.Sidecar, Reason: e.Reason})
+		}
+		v.Cameras = append(v.Cameras, cv)
+	}
+	return v
+}
+
+// printLocalize renders one row per camera, the reasons photos were skipped
+// unless verbose already listed them, and a summary.
+func printLocalize(w io.Writer, res *app.LocalizeResult, verbose bool) error {
+	if verbose {
+		fmt.Fprintln(w)
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "CAMERA\tFILES\tCLOCK ZONE\tLOCAL ZONE\tWRITTEN\tSKIPPED\tDAY CHANGES")
+	for _, c := range res.Cameras {
+		zones := strings.Join(c.LocalZones, ", ")
+		if zones == "" {
+			zones = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%d\t%d\t%d\n", c.Camera, len(c.Entries), clockZoneText(c.ClockZone), zones, c.Written, c.Skipped, c.DayChanges)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if !verbose {
+		for _, c := range res.Cameras {
+			reasons := map[string]int{}
+			var order []string
+			for _, e := range c.Entries {
+				if e.Action != app.ActionSkip && e.Action != app.ActionFail {
+					continue
+				}
+				if reasons[e.Reason] == 0 {
+					order = append(order, e.Reason)
+				}
+				reasons[e.Reason]++
+			}
+			for _, r := range order {
+				fmt.Fprintf(w, "%s: %d %s\n", c.Camera, reasons[r], r)
+			}
+		}
+	}
+	prefix := ""
+	if res.DryRun {
+		prefix = "dry run: "
+	}
+	_, err := fmt.Fprintf(w, "\n%s%d sidecars written (%d new), %d skipped (%d already local), %d failed; local zone from %d phone photos\n",
+		prefix, res.Written, res.Created, res.Skipped, res.Unchanged, res.Failed, res.Evidence)
+	return err
 }

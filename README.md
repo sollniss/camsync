@@ -18,10 +18,11 @@ go build -o camsync ./cmd/camsync
 ## Usage
 
 ```
-camsync list    [DIR] [-v] [-r] [-o table|json]
-camsync suggest [DIR] [--reference NAME]... [--max-offset DURATION]
-camsync shift   [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
-camsync reset   [DIR] --camera NAME [--dry-run]
+camsync list     [DIR] [-v] [-r] [-o table|json]
+camsync suggest  [DIR] [--reference NAME]... [--clock-zone NAME=ZONE]... [--max-offset DURATION]
+camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
+camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
+camsync reset    [DIR] --camera NAME [--dry-run]
 ```
 
 1. See which cameras are in the directory:
@@ -47,7 +48,10 @@ camsync reset   [DIR] --camera NAME [--dry-run]
    Use `--dry-run` (`-n`) first. Shifts accumulate: running `--by 30s` twice
    shifts by one minute. `list` shows the offset currently applied.
 
-4. Undo everything for a camera with `reset`, which writes the timestamps
+4. Optionally rewrite all photos in the local time of the trip with
+   `localize` (see [Local time](#local-time)).
+
+5. Undo everything for a camera with `reset`, which writes the timestamps
    from the image files back into the sidecars.
 
 Durations: `2m30s`, `-45s`, `1h`, `+1d2h`. A leading sign applies to the whole
@@ -61,10 +65,10 @@ prints the shift that fixes it. It writes nothing:
 
 ```
 $ camsync suggest ~/Photos/2024-trip
-#  CAMERA           FILES  CLOCK      SHIFT   CONFIDENCE  NOTES
-1  Apple iPhone 15  210    reference  -       -           phone; GPS: clock exact
-2  Canon EOS R5     132    estimated  +10m4s  high        41 photos within 1m of a reference photo
-3  SONY ILCE-7M3    88     estimated  -2m     medium      12 photos within 1m of a reference photo
+#  CAMERA           FILES  CLOCK      CLOCK ZONE        SHIFT   CONFIDENCE  NOTES
+1  Apple iPhone 15  210    reference  local             -       -           phone; GPS: clock exact
+2  Canon EOS R5     132    estimated  +09:00            +10m4s  high        41 photos within 1m of a reference photo
+3  SONY ILCE-7M3    88     estimated  +00:00 (guessed)  -2m     medium      12 photos within 1m of a reference photo
 
 To apply:
   camsync shift --camera 'Canon EOS R5' --by +10m4s ~/Photos/2024-trip
@@ -96,10 +100,66 @@ Phones are recognised by their `Make` and `Model`. GPS times come from the
 image files only; photos geotagged afterwards from a track log carry a GPS
 time derived from the camera clock and prove nothing about it.
 
+Photos are compared as moments in time, the way Immich orders them, so
+`suggest` needs to know the zone each camera's clock runs on, shown as CLOCK
+ZONE:
+
+- the zone the camera's photos record, such as `+09:00` for a camera left on
+  Japan time on a trip to Germany;
+- `local` for phones, which follow the zone of wherever they are;
+- the zone implied by the camera's GPS times;
+- for a camera without any of these, the whole hour (or a zone seen on the
+  phones) that best lines its wall clock up with the references, marked
+  `(guessed)`. A zone-less camera set to UTC shows up as `+00:00`, one set to
+  local time as the local zone. The clock error is what remains.
+
+Correct a wrong guess with `--clock-zone sony=Z` (camera as for `--camera`,
+any zone `--timezone` accepts). Only when no photo carries any zone
+information are wall clocks compared.
+
+### Local time
+
+Immich shows and groups photos by the zone recorded with their date. A camera
+left on Japan time puts a German evening on the next day, and zone-less
+photos are shown in the wrong zone. `localize` rewrites every photo in the
+local time of where it was taken, keeping the moment, so the photo order does
+not change:
+
+```
+$ camsync localize --dry-run ~/Photos/2017-rügen
+CAMERA                FILES  CLOCK ZONE  LOCAL ZONE  WRITTEN  SKIPPED  DAY CHANGES
+Canon PowerShot G9 X  367    +09:00      +02:00      367      0        6
+HTC Desire 500        343    local       +02:00      168      175      0
+Sony F3111            101    local       -           0        101      0
+HTC Desire 500: 175 already in local time
+Sony F3111: 101 already in local time
+
+dry run: 535 sidecars written (168 new), 276 skipped (276 already local), 0 failed; local zone from 444 phone photos
+```
+
+The local zone comes from the phones: the zone their photos record, or the
+difference between their clock and their GPS time. For each photo the phone
+photo closest in time decides, within `--max-gap` (default 24h), so trips
+across zones and daylight saving changes come out right. A camera's own zone
+setting never counts as evidence. Where no phone photo is within reach,
+`--zone +02:00` sets the local zone; otherwise the photo is skipped.
+
+The moment each photo was taken comes from its camera's clock zone, as shown
+by `suggest`; check it there first and fix a guess with `--clock-zone`.
+Guesses with low confidence are not used. Run `shift` for clock errors before
+`localize`, since the local zone is looked up at the moment the clock says.
+
+`--camera` limits the rewrite to one camera; all cameras still provide
+evidence. `-v` lists every photo. Photos already in local time are left
+alone, so `localize` can be run again after adding photos. `reset` undoes it
+together with any shift. `list` keeps showing only the shift for photos whose
+image records a zone; for a zone-less image it cannot tell a zone change
+from a shift, so a UTC camera localized to +02:00 shows `+2h`.
+
 ### Output for scripts
 
 `--output json` (`-o json`) prints the same information as a JSON document
-instead of a table, for `list` as well as `shift` and `reset`:
+instead of a table, for every command:
 
 ```sh
 camsync list -o json ~/Photos/trip | jq -r '.cameras[] | "\(.index) \(.camera) \(.offset)"'
@@ -170,7 +230,8 @@ Immich parse them exactly like their own.
 ## Timezones
 
 Cameras record wall-clock time. Shifting never converts between zones; it
-moves the wall clock and keeps the zone of the source, if any:
+moves the wall clock and keeps the zone of the source, if any. (Converting to
+the local zone of the trip is what `localize` does.) The zone comes from:
 
 - EXIF `OffsetTimeOriginal` (EXIF 2.31, cameras from about 2019 on) or the
   `OffsetTime` / `OffsetTimeDigitized` tags when that one is missing.

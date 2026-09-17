@@ -130,12 +130,20 @@ type Photo struct {
 }
 
 // Offset is the shift currently applied via the sidecar, if it can be
-// determined.
+// determined. When both timestamps record a zone it is the difference in
+// time, so rewriting a photo in another zone (see PlanLocalize) is no shift;
+// otherwise it is the difference of the wall clocks.
 func (p *Photo) Offset() (time.Duration, bool) {
 	if p.Original == nil || p.FileOriginal == nil {
 		return 0, false
 	}
-	return p.Original.Sub(*p.FileOriginal), true
+	d := p.Original.Sub(*p.FileOriginal)
+	if z, ok := p.Original.ZoneOffset(); ok {
+		if fz, ok := p.FileOriginal.ZoneOffset(); ok {
+			d -= z - fz
+		}
+	}
+	return d, true
 }
 
 // CameraName builds the display name for a camera, avoiding the duplicated

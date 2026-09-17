@@ -154,16 +154,27 @@ func apply(
 		return nil, invalid(err) // the camera value did not select one group
 	}
 	out := &ChangeResult{Camera: g.Camera, DryRun: dryRun}
-	for _, p := range g.Photos {
+	return out, out.run(ctx, g.Photos, plan, progress)
+}
+
+// run plans and writes the change for every photo, recording the outcome.
+// It stops with ctx.Err() when the context is cancelled.
+func (out *ChangeResult) run(
+	ctx context.Context,
+	photos []*camsync.Photo,
+	plan func(*camsync.Photo) (*camsync.Change, error),
+	progress func(Entry),
+) error {
+	for _, p := range photos {
 		if err := ctx.Err(); err != nil {
-			return out, err
+			return err
 		}
 		e := Entry{Path: p.Path, Before: p.Original, Sidecar: p.SidecarTarget}
 		ch, err := plan(p)
 		if err != nil {
 			e.Action, e.Reason = ActionSkip, err.Error()
 			out.Skipped++
-		} else if created, err := ch.Write(dryRun); err != nil {
+		} else if created, err := ch.Write(out.DryRun); err != nil {
 			e.Action, e.Reason = ActionFail, err.Error()
 			out.Failed++
 		} else {
@@ -181,5 +192,5 @@ func apply(
 			progress(e)
 		}
 	}
-	return out, nil
+	return nil
 }

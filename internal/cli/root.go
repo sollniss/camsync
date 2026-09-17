@@ -149,7 +149,7 @@ override both.`,
 		panic(err)
 	}
 
-	root.AddCommand(rt.listCommand(), rt.suggestCommand(), rt.shiftCommand(), rt.resetCommand())
+	root.AddCommand(rt.listCommand(), rt.suggestCommand(), rt.shiftCommand(), rt.localizeCommand(), rt.resetCommand())
 	return rt, root
 }
 

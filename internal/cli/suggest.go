@@ -2,6 +2,8 @@ package cli
 
 import (
 	"errors"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -9,9 +11,60 @@ import (
 	"github.com/sollniss/camsync/app"
 )
 
+// clockFlags are the flags of the clock estimation, shared by suggest and
+// localize.
+type clockFlags struct {
+	references, clockZones []string
+	maxOffset, maxZoneGap  string
+}
+
+func (c *clockFlags) register(cmd *cobra.Command, zoneGap bool) {
+	f := cmd.Flags()
+	f.StringArrayVar(&c.references, "reference", nil, `trusted camera as printed by "list"; repeat for several (default: phones and cameras that agree with GPS)`)
+	f.StringArrayVar(&c.clockZones, "clock-zone", nil, `zone a camera's clock runs on, as CAMERA=ZONE, e.g. "sony=Z" or "canon=+09:00"; repeat for several`)
+	f.StringVar(&c.maxOffset, "max-offset", "", "largest clock error to search for, e.g. 30m or 14h (default 12h)")
+	completions := map[string]cobra.CompletionFunc{"reference": completeCamera, "clock-zone": completeClockZone, "max-offset": noFileComp}
+	if zoneGap {
+		f.StringVar(&c.maxZoneGap, "max-gap", "", "how far in time a phone photo tells the local zone (default 24h)")
+		completions["max-gap"] = noFileComp
+	}
+	registerCompletions(cmd, completions)
+}
+
+func (c *clockFlags) settings() (app.ClockSettings, error) {
+	s := app.ClockSettings{References: c.references, ClockZones: c.clockZones}
+	for _, d := range []struct {
+		flag, value string
+		dst         *time.Duration
+	}{{"--max-offset", c.maxOffset, &s.MaxOffset}, {"--max-gap", c.maxZoneGap, &s.MaxZoneGap}} {
+		if d.value == "" {
+			continue
+		}
+		v, err := camsync.ParseShift(d.value)
+		if err != nil {
+			return s, usage(err)
+		}
+		if v <= 0 {
+			return s, usage(errors.New(d.flag + " must be positive"))
+		}
+		*d.dst = v
+	}
+	return s, nil
+}
+
+// completeClockZone offers the camera names followed by "=".
+func completeClockZone(cmd *cobra.Command, args []string, toComplete string) ([]cobra.Completion, cobra.ShellCompDirective) {
+	names, directive := completeCamera(cmd, args, toComplete)
+	var out []cobra.Completion
+	for _, n := range names {
+		name, _, _ := strings.Cut(n, "\t")
+		out = append(out, name+"=")
+	}
+	return out, directive | cobra.ShellCompDirectiveNoSpace
+}
+
 func (rt *runtime) suggestCommand() *cobra.Command {
-	var references []string
-	var maxOffset string
+	var clock clockFlags
 	cmd := &cobra.Command{
 		Use:   "suggest [DIR]",
 		Short: "Estimate how far each camera's clock is off",
@@ -32,27 +85,28 @@ the cameras to have been at the same places for at least a few moments.
 The result is usually right to within a minute; photos of the very same
 moment make it more precise.
 
+Photos are compared as moments in time, so every camera's CLOCK ZONE, the
+zone its clock runs on, matters. It is the zone its photos record, "local"
+for phones, the zone implied by GPS times, or, for a camera without any of
+these, the whole hour that best lines up its wall clock with the references.
+A camera set to UTC shows up as +00:00, one left on Japan time as +09:00.
+Override a guess with --clock-zone CAMERA=ZONE.
+
 CONFIDENCE is high when no other shift comes close to explaining the photos
 equally well, and low when the photos are too few or too evenly spread to
 tell. --max-offset limits the search (default 12h); beyond half a day the
 previous or next day's activity easily looks like a match.`,
 		Example: `  camsync suggest ~/Photos/trip
   camsync suggest --reference "Canon EOS R5" ~/Photos/trip
-  camsync suggest --max-offset 2h -o json ~/Photos/trip`,
+  camsync suggest --clock-zone sony=Z --max-offset 2h -o json ~/Photos/trip`,
 		Args:              dirArgs,
 		ValidArgsFunction: completeDirs,
 		RunE: rt.runE(func(cmd *cobra.Command, args []string) error {
-			q := app.SuggestQuery{Scope: rt.scope(args), References: references}
-			if maxOffset != "" {
-				d, err := camsync.ParseShift(maxOffset)
-				if err != nil {
-					return usage(err)
-				}
-				if d <= 0 {
-					return usage(errors.New("--max-offset must be positive"))
-				}
-				q.MaxOffset = d
+			settings, err := clock.settings()
+			if err != nil {
+				return err
 			}
+			q := app.SuggestQuery{Scope: rt.scope(args), ClockSettings: settings}
 			res, err := app.SuggestHandler{}.Handle(cmd.Context(), q)
 			if err != nil {
 				return err
@@ -64,10 +118,7 @@ previous or next day's activity easily looks like a match.`,
 			return printSuggest(out, res, shiftFlags(q.Scope))
 		}),
 	}
-	f := cmd.Flags()
-	f.StringArrayVar(&references, "reference", nil, `trusted camera as printed by "list"; repeat for several (default: phones and cameras that agree with GPS)`)
-	f.StringVar(&maxOffset, "max-offset", "", "largest clock offset to search for, e.g. 30m or 14h (default 12h)")
-	registerCompletions(cmd, map[string]cobra.CompletionFunc{"reference": completeCamera, "max-offset": noFileComp})
+	clock.register(cmd, false)
 	return cmd
 }
 

@@ -257,3 +257,13 @@ func FormatZone(d time.Duration) string {
 	}
 	return fmt.Sprintf("%s%02d:%02d", sign, int(d.Hours()), int(d.Minutes())%60)
 }
+
+// ParseZoneOffset parses a UTC offset in any form ParseZone accepts.
+func ParseZoneOffset(v string) (time.Duration, error) {
+	tz, err := ParseZone(v)
+	if err != nil {
+		return 0, err
+	}
+	d, _ := Stamp{TZ: tz}.ZoneOffset()
+	return d, nil
+}
