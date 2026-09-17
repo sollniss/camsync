@@ -117,6 +117,11 @@ type Photo struct {
 	Original  *Stamp
 	Digitized *Stamp
 
+	// GPSTime is the UTC time from the image's GPS block, if any. It comes
+	// from a satellite or network clock, not the camera's, so it can tell
+	// whether the camera clock is right.
+	GPSTime *time.Time
+
 	Sidecar       string // existing sidecar path, "" if none
 	SidecarTarget string // where a sidecar will be written
 	Err           error  // problem that prevents shifting this photo
@@ -200,6 +205,9 @@ func loadPhoto(path, target, sidecar string) *Photo {
 	p.Make, p.Model = tags[exif.TagMake], tags[exif.TagModel]
 	p.FileOriginal, p.FileDigitized = stampsFromExif(tags)
 	p.Original, p.Digitized = p.FileOriginal, p.FileDigitized
+	if gps, ok := ParseGPSTime(tags[exif.TagGPSDateStamp], tags[exif.TagGPSTimeStamp]); ok {
+		p.GPSTime = &gps
+	}
 
 	if sc := sidecar; sc != "" {
 		p.Sidecar, p.SidecarTarget = sc, sc

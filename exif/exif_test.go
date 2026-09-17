@@ -177,3 +177,33 @@ func TestNikonTimeZone(t *testing.T) {
 		})
 	}
 }
+
+func TestGPS(t *testing.T) {
+	for _, bo := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		ifd := append([]testimg.Entry{testimg.GPS(bo, "2024:05:01", 10, 34, 50.5)}, ifd0...)
+		p := writeTemp(t, "gps.jpg", testimg.JPEG(testimg.BuildTIFF(bo, ifd, exifIFD)))
+		tags, _, err := exif.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tags[exif.TagGPSDateStamp] != "2024:05:01" || tags[exif.TagGPSTimeStamp] != "10:34:50.5" || tags[exif.TagDateTimeOriginal] != "2024:05:01 12:34:56" {
+			t.Errorf("%v: tags = %v", bo, tags)
+		}
+	}
+	// A GPS pointer to garbage keeps the other tags.
+	bad := append([]testimg.Entry{{Tag: exif.TagGPSIFD, Type: 4, Data: []byte{0xFF, 0xFF, 0, 0}}}, ifd0...)
+	tags, _, err := exif.ReadFile(writeTemp(t, "bad.jpg", testimg.JPEG(testimg.BuildTIFF(binary.LittleEndian, bad, exifIFD))))
+	if err != nil || tags[exif.TagMake] != "Canon" || tags[exif.TagGPSTimeStamp] != "" {
+		t.Errorf("bad GPS pointer: %v %v", tags, err)
+	}
+	// CR3 keeps GPS in CMT4, a TIFF block whose first IFD is the GPS IFD.
+	cr3 := testimg.CR3(
+		testimg.BuildTIFF(binary.LittleEndian, ifd0, nil),
+		testimg.BuildTIFF(binary.LittleEndian, exifIFD, nil),
+		testimg.GPSBlock(binary.BigEndian, "2024:05:01", 10, 34, 50),
+	)
+	tags, _, err = exif.ReadFile(writeTemp(t, "a.cr3", cr3))
+	if err != nil || tags[exif.TagGPSTimeStamp] != "10:34:50" || tags[exif.TagGPSDateStamp] != "2024:05:01" || tags[exif.TagMake] != "Canon" {
+		t.Errorf("cr3: %v %v", tags, err)
+	}
+}

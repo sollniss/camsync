@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"strings"
 )
 
@@ -29,6 +30,13 @@ const (
 	TagSubSecTime          = 0x9290
 	TagSubSecTimeOriginal  = 0x9291
 	TagSubSecTimeDigitized = 0x9292
+	TagGPSIFD              = 0x8825
+
+	// Tags of the GPS IFD. Their IDs collide with nothing above, so they
+	// share the Tags map. Both are UTC: GPSTimeStamp is stored as "15:04:05"
+	// plus fractional seconds when present, GPSDateStamp as "2006:01:02".
+	TagGPSTimeStamp = 0x0007
+	TagGPSDateStamp = 0x001D
 )
 
 var wantedTags = map[uint16]bool{
@@ -78,6 +86,8 @@ type tiffReader struct {
 
 	// MakerNote location, recorded while reading the Exif IFD.
 	makerOff, makerLen int64
+	// GPS IFD offset, recorded while reading IFD0.
+	gpsIFD int64
 }
 
 func (t *tiffReader) bytes(off, n int64) ([]byte, error) {
@@ -103,26 +113,12 @@ func isTIFFHeader(b []byte) bool {
 // ParseTIFF reads IFD0 and the Exif sub-IFD of a TIFF structure located at
 // base within r. Only the tags in wantedTags are collected.
 func ParseTIFF(r io.ReaderAt, base, size int64) (Tags, error) {
-	t := &tiffReader{r: r, base: base, size: size}
-	hdr, err := t.bytes(0, 8)
+	t, ifd0, err := newTIFFReader(r, base, size)
 	if err != nil {
 		return nil, err
 	}
-	switch string(hdr[:2]) {
-	case "II":
-		t.bo = binary.LittleEndian
-	case "MM":
-		t.bo = binary.BigEndian
-	default:
-		return nil, errors.New("exif: bad TIFF byte order mark")
-	}
-	switch t.bo.Uint16(hdr[2:4]) {
-	case 42, 0x4F52, 0x0055: // classic TIFF, ORF, RW2
-	default:
-		return nil, errors.New("exif: bad TIFF magic")
-	}
 	tags := Tags{}
-	exifIFD, err := t.readIFD(int64(t.bo.Uint32(hdr[4:8])), tags)
+	exifIFD, err := t.readIFD(ifd0, tags)
 	if err != nil {
 		return nil, err
 	}
@@ -132,11 +128,106 @@ func ParseTIFF(r io.ReaderAt, base, size int64) (Tags, error) {
 			return nil, err
 		}
 	}
+	if t.gpsIFD > 0 {
+		t.readGPS(t.gpsIFD, tags)
+	}
 	if len(tags) == 0 {
 		return nil, ErrNotFound
 	}
 	t.readMakerNoteTimeZone(tags)
 	return tags, nil
+}
+
+// ParseGPSTIFF reads a TIFF structure whose first IFD is a GPS IFD, which is
+// how Canon CR3 files store GPS data (the CMT4 box).
+func ParseGPSTIFF(r io.ReaderAt, base, size int64) (Tags, error) {
+	t, ifd0, err := newTIFFReader(r, base, size)
+	if err != nil {
+		return nil, err
+	}
+	tags := Tags{}
+	t.readGPS(ifd0, tags)
+	if len(tags) == 0 {
+		return nil, ErrNotFound
+	}
+	return tags, nil
+}
+
+// newTIFFReader checks the TIFF header at base and returns a reader for it
+// along with the offset of the first IFD.
+func newTIFFReader(r io.ReaderAt, base, size int64) (*tiffReader, int64, error) {
+	t := &tiffReader{r: r, base: base, size: size}
+	hdr, err := t.bytes(0, 8)
+	if err != nil {
+		return nil, 0, err
+	}
+	switch string(hdr[:2]) {
+	case "II":
+		t.bo = binary.LittleEndian
+	case "MM":
+		t.bo = binary.BigEndian
+	default:
+		return nil, 0, errors.New("exif: bad TIFF byte order mark")
+	}
+	switch t.bo.Uint16(hdr[2:4]) {
+	case 42, 0x4F52, 0x0055: // classic TIFF, ORF, RW2
+	default:
+		return nil, 0, errors.New("exif: bad TIFF magic")
+	}
+	return t, int64(t.bo.Uint32(hdr[4:8])), nil
+}
+
+// readGPS collects GPSTimeStamp and GPSDateStamp from the GPS IFD at off. A
+// damaged GPS IFD is ignored; it must not cost the photo its other tags.
+func (t *tiffReader) readGPS(off int64, tags Tags) {
+	entries, err := t.ifdEntries(off, t.bo)
+	if err != nil {
+		return
+	}
+	for i := 0; i+12 <= len(entries); i += 12 {
+		e := entries[i : i+12]
+		tag, typ, count := t.bo.Uint16(e[0:2]), t.bo.Uint16(e[2:4]), t.bo.Uint32(e[4:8])
+		switch {
+		case tag == TagGPSTimeStamp && typ == 5 && count == 3: // three RATIONALs
+			b, err := t.bytes(int64(t.bo.Uint32(e[8:12])), 24)
+			if err != nil {
+				continue
+			}
+			var hms [3]float64
+			valid := true
+			for j := range hms {
+				num, den := t.bo.Uint32(b[j*8:]), t.bo.Uint32(b[j*8+4:])
+				valid = valid && den != 0
+				if den != 0 {
+					hms[j] = float64(num) / float64(den)
+				}
+			}
+			if s, ok := formatGPSTime(hms); ok && valid {
+				tags[TagGPSTimeStamp] = s
+			}
+		case tag == TagGPSDateStamp && typ == 2 && count > 4 && count <= 64:
+			if b, err := t.bytes(int64(t.bo.Uint32(e[8:12])), int64(count)); err == nil {
+				if s := cleanString(b); s != "" {
+					tags[TagGPSDateStamp] = s
+				}
+			}
+		}
+	}
+}
+
+// formatGPSTime renders hours, minutes and seconds as "15:04:05", adding the
+// fractional seconds (to the millisecond) when there are any.
+func formatGPSTime(hms [3]float64) (string, bool) {
+	h, m, s := hms[0], hms[1], hms[2]
+	if h >= 24 || m >= 60 || s >= 61 || h != math.Trunc(h) || m != math.Trunc(m) {
+		return "", false
+	}
+	ms := int(math.Round(s * 1000))
+	out := fmt.Sprintf("%02d:%02d:%02d", int(h), int(m), ms/1000)
+	if frac := ms % 1000; frac != 0 {
+		out += strings.TrimRight(fmt.Sprintf(".%03d", frac), "0")
+	}
+	return out, true
 }
 
 const (
@@ -314,6 +405,10 @@ func (t *tiffReader) readIFD(off int64, tags Tags) (exifIFD int64, err error) {
 			} else {
 				exifIFD = int64(t.bo.Uint32(val))
 			}
+			continue
+		}
+		if tag == TagGPSIFD {
+			t.gpsIFD = int64(t.bo.Uint32(val))
 			continue
 		}
 		if tag == tagMakerNote && count > 4 {

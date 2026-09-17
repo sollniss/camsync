@@ -417,8 +417,8 @@ func parseHEIF(r io.ReaderAt, size int64) (Tags, error) {
 
 var canonCR3UUID = []byte{0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48}
 
-// parseCR3 reads the CMT1 (IFD0) and CMT2 (Exif IFD) TIFF blocks that Canon
-// stores in a uuid box inside moov.
+// parseCR3 reads the CMT1 (IFD0), CMT2 (Exif IFD) and CMT4 (GPS IFD) TIFF
+// blocks that Canon stores in a uuid box inside moov.
 func parseCR3(r io.ReaderAt, size int64) (Tags, error) {
 	top, err := readBoxes(r, 0, size)
 	if err != nil {
@@ -440,6 +440,11 @@ func parseCR3(r io.ReaderAt, size int64) (Tags, error) {
 				if t, err := ParseTIFF(r, b.data, b.end-b.data); err == nil {
 					tags.merge(t)
 				}
+			}
+		}
+		if b := findBox(inner, "CMT4"); b != nil && len(tags) > 0 {
+			if t, err := ParseGPSTIFF(r, b.data, b.end-b.data); err == nil {
+				tags.merge(t)
 			}
 		}
 		if len(tags) > 0 {

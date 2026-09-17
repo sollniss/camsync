@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/sollniss/camsync"
@@ -180,4 +183,150 @@ func printChangeSummary(w io.Writer, res *app.ChangeResult) {
 	}
 	fmt.Fprintf(w, "%s%q %s: %d sidecars written (%d new), %d skipped, %d failed\n",
 		prefix, res.Camera, what, res.Written, res.Created, res.Skipped, res.Failed)
+}
+
+type gpsView struct {
+	Photos       int    `json:"photos"`
+	Error        string `json:"error"`
+	Zone         string `json:"zone"`
+	ZoneInferred bool   `json:"zoneInferred"`
+}
+
+type suggestionView struct {
+	Index      int      `json:"index"`
+	Camera     string   `json:"camera"`
+	Files      int      `json:"files"`
+	Reference  bool     `json:"reference"`
+	Basis      string   `json:"basis,omitempty"`
+	Shift      *string  `json:"shift"`
+	Confidence string   `json:"confidence,omitempty"`
+	Matched    int      `json:"matched"`
+	GPS        *gpsView `json:"gps"`
+	Note       string   `json:"note,omitempty"`
+}
+
+type suggestJSON struct {
+	MaxOffset string           `json:"maxOffset"`
+	Cameras   []suggestionView `json:"cameras"`
+}
+
+func suggestView(res *app.SuggestResult) suggestJSON {
+	v := suggestJSON{MaxOffset: camsync.FormatDuration(res.MaxOffset), Cameras: []suggestionView{}}
+	for _, c := range res.Cameras {
+		sv := suggestionView{
+			Index: c.Index, Camera: c.Name, Files: c.Files, Reference: c.Reference, Basis: string(c.Basis),
+			Confidence: string(c.Confidence), Matched: c.Matched, Note: c.Note,
+		}
+		if c.Found {
+			s := camsync.FormatDuration(c.Offset)
+			sv.Shift = &s
+		}
+		if g := c.GPS; g != nil {
+			sv.GPS = &gpsView{Photos: g.Photos, Error: camsync.FormatDuration(g.Error), Zone: camsync.FormatZone(g.Zone), ZoneInferred: g.ZoneInferred}
+		}
+		v.Cameras = append(v.Cameras, sv)
+	}
+	return v
+}
+
+// printSuggest renders a suggestion table followed by the shift commands
+// that apply the estimates. shiftArgs are appended to every command.
+func printSuggest(w io.Writer, res *app.SuggestResult, shiftArgs []string) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "#\tCAMERA\tFILES\tCLOCK\tSHIFT\tCONFIDENCE\tNOTES")
+	references := 0
+	var refZones []string
+	for _, c := range res.Cameras {
+		if c.Reference {
+			references++
+			if c.Zone != "" && !slices.Contains(refZones, c.Zone) {
+				refZones = append(refZones, c.Zone)
+			}
+		}
+	}
+	for _, c := range res.Cameras {
+		clock, shift, conf := "unknown", "-", "-"
+		switch {
+		case c.Reference:
+			clock = "reference"
+		case c.Found:
+			clock, shift, conf = "estimated", camsync.FormatDuration(c.Offset), string(c.Confidence)
+		}
+		notes := suggestNotes(c)
+		if !c.Reference && c.Zone != "" && len(refZones) > 0 && !slices.Contains(refZones, c.Zone) {
+			// Worth a look: either the camera was left on another zone, which
+			// is fine, or its zone setting is wrong and needs --timezone.
+			notes = strings.TrimPrefix(notes+"; zone "+c.Zone+", references "+strings.Join(refZones, ", "), "; ")
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%d\t%s\t%s\t%s\t%s\n", c.Index, c.Name, c.Files, clock, shift, conf, notes)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	if references == 0 {
+		_, err := fmt.Fprintln(w, "\nNo trusted clock found. Name a camera whose clock is right with --reference.")
+		return err
+	}
+	var cmds []string
+	for _, c := range res.Cameras {
+		if !c.Found || c.Offset == 0 {
+			continue
+		}
+		args := append([]string{"camsync", "shift", "--camera", c.Name, "--by", camsync.FormatDuration(c.Offset)}, shiftArgs...)
+		for i, a := range args {
+			args[i] = shellQuote(a)
+		}
+		line := "  " + strings.Join(args, " ")
+		if c.Confidence == camsync.ConfidenceLow {
+			line += "  # low confidence: compare a few photos first"
+		}
+		cmds = append(cmds, line)
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "\nTo apply:\n%s\n", strings.Join(cmds, "\n"))
+	return err
+}
+
+// suggestNotes explains one row of the suggestion table.
+func suggestNotes(c app.Suggestion) string {
+	var parts []string
+	switch {
+	case c.Reference:
+		switch c.Basis {
+		case camsync.BasisPhone:
+			parts = append(parts, "phone")
+		case camsync.BasisUser:
+			parts = append(parts, "named with --reference")
+		}
+	case c.Basis == camsync.BasisGPS:
+		parts = append(parts, fmt.Sprintf("measured against GPS time in %d photos", c.Matched))
+	case c.Basis == camsync.BasisActivity:
+		parts = append(parts, fmt.Sprintf("%d photos within %s of a reference photo", c.Matched, strings.TrimPrefix(camsync.FormatDuration(camsync.MatchWindow), "+")))
+	case c.Note != "":
+		parts = append(parts, c.Note)
+	}
+	if g := c.GPS; g != nil && (c.Reference || c.Basis != camsync.BasisGPS) {
+		gps := "GPS: clock " + camsync.FormatDuration(g.Error)
+		if g.Error == 0 {
+			gps = "GPS: clock exact"
+		}
+		if g.ZoneInferred {
+			gps += " (zone unknown, assumed " + camsync.FormatZone(g.Zone) + ")"
+		}
+		parts = append(parts, gps)
+	}
+	return strings.Join(parts, "; ")
+}
+
+var shellSafeRe = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./~-]+$`)
+
+// shellQuote quotes s for POSIX shells when it contains anything special.
+func shellQuote(s string) string {
+	if shellSafeRe.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

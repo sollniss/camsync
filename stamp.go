@@ -134,6 +134,39 @@ func ParseExifStamp(dt, subsec, tz string) (Stamp, bool) {
 	return s, true
 }
 
+// ParseGPSTime combines the EXIF GPSDateStamp ("2006:01:02") and the
+// GPSTimeStamp as the exif package renders it ("15:04:05", optionally with
+// fractional seconds) into a UTC time.
+func ParseGPSTime(date, clock string) (time.Time, bool) {
+	d, err := time.Parse("2006:01:02", strings.TrimSpace(date))
+	if err != nil || d.Year() < 1990 { // GPS receivers without a fix report 1980 or 0000
+		return time.Time{}, false
+	}
+	c, err := time.Parse("15:04:05", strings.TrimSpace(clock)) // fractions are accepted too
+	if err != nil {
+		return time.Time{}, false
+	}
+	return d.Add(c.Sub(time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC))), true
+}
+
+// ZoneOffset returns the stamp's UTC offset, if it has one.
+func (s Stamp) ZoneOffset() (time.Duration, bool) {
+	if s.TZ == "Z" {
+		return 0, true
+	}
+	m := zoneRe.FindStringSubmatch(s.TZ)
+	if m == nil {
+		return 0, false
+	}
+	h, _ := strconv.Atoi(m[2])
+	mi, _ := strconv.Atoi(m[3])
+	d := time.Duration(h)*time.Hour + time.Duration(mi)*time.Minute
+	if m[1] == "-" {
+		d = -d
+	}
+	return d, true
+}
+
 // ParseXMPStamp parses an XMP (ISO 8601) date value.
 func ParseXMPStamp(v string) (Stamp, bool) {
 	m := xmpDateRe.FindStringSubmatch(strings.TrimSpace(v))
@@ -214,4 +247,13 @@ func ParseShift(v string) (time.Duration, error) {
 		d = -d
 	}
 	return d, nil
+}
+
+// FormatZone renders a UTC offset in the "+hh:mm" form of XMP dates.
+func FormatZone(d time.Duration) string {
+	sign := "+"
+	if d < 0 {
+		sign, d = "-", -d
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, int(d.Hours()), int(d.Minutes())%60)
 }

@@ -207,9 +207,14 @@ func HEIF(tiff []byte, method int) []byte {
 
 var canonUUID = []byte{0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48}
 
-// CR3 builds a Canon CR3 skeleton with the given IFD0 and Exif TIFF blocks.
-func CR3(ifd0, exifIFD []byte) []byte {
-	uuid := Box("uuid", canonUUID, Box("CMT1", ifd0), Box("CMT2", exifIFD))
+// CR3 builds a Canon CR3 skeleton with the given IFD0 and Exif TIFF blocks
+// and, if given, a GPS block (see GPSBlock).
+func CR3(ifd0, exifIFD []byte, gps ...[]byte) []byte {
+	boxes := [][]byte{canonUUID, Box("CMT1", ifd0), Box("CMT2", exifIFD)}
+	for _, g := range gps {
+		boxes = append(boxes, Box("CMT4", g))
+	}
+	uuid := Box("uuid", boxes...)
 	moov := Box("moov", uuid)
 	return bytes.Join([][]byte{Box("ftyp", []byte("crx "), be32(1), []byte("crx isom")), moov, Box("mdat", []byte("x"))}, nil)
 }
@@ -310,5 +315,53 @@ func nikonWorldTimeIFD(bo binary.ByteOrder, tzMinutes int, dst bool) []byte {
 	}
 	b.WriteByte(2) // DateDisplayFormat D/M/Y
 	put(uint32(0)) // next IFD
+	return b.Bytes()
+}
+
+// GPS returns a GPSInfo entry for IFD0 pointing at a GPS IFD with the given
+// UTC date ("2006:01:02") and time. The IFD is the entry's out-of-line data,
+// so the entry's value field is its offset, which is what a GPSInfo pointer
+// holds.
+func GPS(bo binary.ByteOrder, date string, h, m int, sec float64) Entry {
+	return Entry{Tag: exif.TagGPSIFD, Type: 4, Build: func(off int) []byte { return gpsIFD(bo, off, date, h, m, sec) }}
+}
+
+// GPSBlock builds a TIFF block whose first IFD is a GPS IFD, the layout of
+// the CMT4 box in Canon CR3 files.
+func GPSBlock(bo binary.ByteOrder, date string, h, m int, sec float64) []byte {
+	var b bytes.Buffer
+	if bo == binary.LittleEndian {
+		b.WriteString("II")
+	} else {
+		b.WriteString("MM")
+	}
+	_ = binary.Write(&b, bo, uint16(42))
+	_ = binary.Write(&b, bo, uint32(8))
+	b.Write(gpsIFD(bo, 8, date, h, m, sec))
+	return b.Bytes()
+}
+
+// gpsIFD builds a GPS IFD holding GPSTimeStamp and GPSDateStamp that starts
+// at the absolute TIFF offset off, with its values right behind it.
+func gpsIFD(bo binary.ByteOrder, off int, date string, h, m int, sec float64) []byte {
+	var b bytes.Buffer
+	put := func(v any) { _ = binary.Write(&b, bo, v) }
+	dataOff := off + 2 + 2*12 + 4
+	put(uint16(2))
+	put(uint16(exif.TagGPSTimeStamp))
+	put(uint16(5)) // RATIONAL
+	put(uint32(3))
+	put(uint32(dataOff))
+	put(uint16(exif.TagGPSDateStamp))
+	put(uint16(2)) // ASCII
+	put(uint32(len(date) + 1))
+	put(uint32(dataOff + 24))
+	put(uint32(0)) // next IFD
+	for _, r := range [][2]uint32{{uint32(h), 1}, {uint32(m), 1}, {uint32(sec * 1000), 1000}} {
+		put(r[0])
+		put(r[1])
+	}
+	b.WriteString(date)
+	b.WriteByte(0)
 	return b.Bytes()
 }

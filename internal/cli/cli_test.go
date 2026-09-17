@@ -3,12 +3,16 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/sollniss/camsync/exif"
 	"github.com/sollniss/camsync/internal/testimg"
 	"github.com/sollniss/camsync/xmp"
 )
@@ -292,5 +296,112 @@ func TestExitCodes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := Main(ctx, []string{"list", dir}, &stdout, &stderr); code != ExitInterrupted {
 		t.Errorf("cancelled: %d %q", code, stderr.String())
+	}
+}
+
+// tripDir writes photos of the same moments from a phone with GPS and a
+// Canon whose clock runs 10m4s behind.
+func tripDir(t *testing.T) string {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	start := time.Date(2024, 5, 1, 9, 0, 0, 0, time.UTC)
+	for i, gap := range []int{0, 1300, 700, 2900, 400, 3000, 1800, 900} {
+		at := start.Add(time.Duration(i*3600+gap) * time.Second)
+		utc := at.Add(-2 * time.Hour)
+		phone := testimg.BuildTIFF(binary.LittleEndian,
+			[]testimg.Entry{testimg.ASCII(exif.TagMake, "Apple"), testimg.ASCII(exif.TagModel, "iPhone 15"), testimg.GPS(binary.LittleEndian, utc.Format("2006:01:02"), utc.Hour(), utc.Minute(), float64(utc.Second()))},
+			[]testimg.Entry{testimg.ASCII(exif.TagDateTimeOriginal, at.Format("2006:01:02 15:04:05")), testimg.ASCII(exif.TagOffsetTimeOriginal, "+02:00")})
+		mustWrite(t, filepath.Join(dir, fmt.Sprintf("IMG_%04d.HEIC", i)), testimg.HEIF(phone, 0))
+		canon := at.Add(-10*time.Minute - 4*time.Second).Format("2006:01:02 15:04:05")
+		mustWrite(t, filepath.Join(dir, fmt.Sprintf("CAN_%04d.JPG", i)), testimg.JPEG(testimg.Simple("Canon", "Canon EOS R5", canon)))
+	}
+	return dir
+}
+
+func TestSuggestFlow(t *testing.T) {
+	dir := tripDir(t)
+	code, out, errOut := run(t, "suggest", dir)
+	if code != 0 || errOut != "" {
+		t.Fatalf("code %d, stderr %q\n%s", code, errOut, out)
+	}
+	apply := "camsync shift --camera 'Canon EOS R5' --by +10m4s " + shellQuote(dir)
+	for _, want := range []string{"reference", "phone; GPS: clock exact", "estimated  +10m4s  high", "8 photos within 1m of a reference photo", apply} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+
+	code, out, _ = run(t, "suggest", "-o", "json", dir)
+	var v struct {
+		MaxOffset string `json:"maxOffset"`
+		Cameras   []struct {
+			Camera     string  `json:"camera"`
+			Reference  bool    `json:"reference"`
+			Basis      string  `json:"basis"`
+			Shift      *string `json:"shift"`
+			Confidence string  `json:"confidence"`
+			GPS        *struct {
+				Photos int    `json:"photos"`
+				Error  string `json:"error"`
+				Zone   string `json:"zone"`
+			} `json:"gps"`
+		} `json:"cameras"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); code != 0 || err != nil {
+		t.Fatalf("%d %v\n%s", code, err, out)
+	}
+	if len(v.Cameras) != 2 || v.MaxOffset != "+12h" {
+		t.Fatalf("json = %+v", v)
+	}
+	if c := v.Cameras[0]; c.Camera != "Apple iPhone 15" || !c.Reference || c.Basis != "phone" || c.Shift != nil || c.GPS == nil || c.GPS.Photos != 8 || c.GPS.Error != "none" || c.GPS.Zone != "+02:00" {
+		t.Errorf("phone = %+v", c)
+	}
+	if c := v.Cameras[1]; c.Reference || c.Basis != "activity" || c.Shift == nil || *c.Shift != "+10m4s" || c.Confidence != "high" || c.GPS != nil {
+		t.Errorf("canon = %+v", c)
+	}
+
+	// Applying the suggestion leaves nothing to do.
+	if code, out, _ := run(t, "shift", "--camera", "Canon EOS R5", "--by", "+10m4s", dir); code != 0 {
+		t.Fatal(out)
+	}
+	code, out, _ = run(t, "suggest", dir)
+	if code != 0 || !strings.Contains(out, "estimated  none") || strings.Contains(out, "To apply") {
+		t.Errorf("after shift: %d\n%s", code, out)
+	}
+
+	// A named reference replaces the automatic choice, but a camera with GPS
+	// times and a zone is still measured against GPS time.
+	code, out, _ = run(t, "suggest", "--reference", "canon", dir)
+	if code != 0 || !strings.Contains(out, "named with --reference") || !strings.Contains(out, "estimated  none   high        measured against GPS time in 8 photos") {
+		t.Errorf("user reference: %d\n%s", code, out)
+	}
+}
+
+func TestSuggestErrors(t *testing.T) {
+	dir := setup(t)
+	code, out, _ := run(t, "suggest", dir)
+	if code != 0 || !strings.Contains(out, "No trusted clock found") || !strings.Contains(out, "no reference camera") {
+		t.Errorf("no reference: %d\n%s", code, out)
+	}
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"suggest", "--reference", "nikon", dir}, "no camera matches"},
+		{[]string{"suggest", "--max-offset", "-1h", dir}, "--max-offset must be positive"},
+		{[]string{"suggest", "--max-offset", "soon", dir}, "invalid duration"},
+	} {
+		if code, _, errOut := run(t, c.args...); code != ExitUsage || !strings.Contains(errOut, c.want) {
+			t.Errorf("%v: code %d, stderr %q", c.args, code, errOut)
+		}
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	for in, want := range map[string]string{"sony": "sony", "+10m4s": "+10m4s", "/a/b-c": "/a/b-c", "Canon EOS R5": "'Canon EOS R5'", "it's": `'it'\''s'`} {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

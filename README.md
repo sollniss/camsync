@@ -18,9 +18,10 @@ go build -o camsync ./cmd/camsync
 ## Usage
 
 ```
-camsync list  [DIR] [-v] [-r] [-o table|json]
-camsync shift [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
-camsync reset [DIR] --camera NAME [--dry-run]
+camsync list    [DIR] [-v] [-r] [-o table|json]
+camsync suggest [DIR] [--reference NAME]... [--max-offset DURATION]
+camsync shift   [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
+camsync reset   [DIR] --camera NAME [--dry-run]
 ```
 
 1. See which cameras are in the directory:
@@ -32,7 +33,11 @@ camsync reset [DIR] --camera NAME [--dry-run]
    2  SONY ILCE-7M3  88     2024-05-01 08:10:55  2024-05-04 19:40:01  none    0
    ```
 
-2. Shift one camera. `--camera` takes the name case-insensitively, the row
+2. Let `suggest` work out how far each camera is off (see
+   [Finding the offset](#finding-the-offset)), or compare a few photos
+   yourself.
+
+3. Shift one camera. `--camera` takes the name case-insensitively, the row
    number from the list, or a unique substring of the name:
 
    ```
@@ -42,12 +47,54 @@ camsync reset [DIR] --camera NAME [--dry-run]
    Use `--dry-run` (`-n`) first. Shifts accumulate: running `--by 30s` twice
    shifts by one minute. `list` shows the offset currently applied.
 
-3. Undo everything for a camera with `reset`, which writes the timestamps
+4. Undo everything for a camera with `reset`, which writes the timestamps
    from the image files back into the sidecars.
 
 Durations: `2m30s`, `-45s`, `1h`, `+1d2h`. A leading sign applies to the whole
 value. `--timezone +02:00` (or `--tz`) stamps a zone on the written dates (see Timezones). Add
 `-r` to include sub-directories. Every command has `--help` with examples.
+
+### Finding the offset
+
+`suggest` measures every camera against the clocks that can be trusted and
+prints the shift that fixes it. It writes nothing:
+
+```
+$ camsync suggest ~/Photos/2024-trip
+#  CAMERA           FILES  CLOCK      SHIFT   CONFIDENCE  NOTES
+1  Apple iPhone 15  210    reference  -       -           phone; GPS: clock exact
+2  Canon EOS R5     132    estimated  +10m4s  high        41 photos within 1m of a reference photo
+3  SONY ILCE-7M3    88     estimated  -2m     medium      12 photos within 1m of a reference photo
+
+To apply:
+  camsync shift --camera 'Canon EOS R5' --by +10m4s ~/Photos/2024-trip
+  camsync shift --camera 'SONY ILCE-7M3' --by -2m ~/Photos/2024-trip
+```
+
+The reference clocks are phones, whose clocks are set from the network, and
+cameras whose timestamps agree with the GPS time in their photos (within a
+minute). Name them yourself with `--reference`, repeated for several, when
+there is no phone or you set a camera's clock carefully.
+
+A camera whose photos carry GPS time and a time zone is measured against GPS
+time directly. Every other camera is assumed to be off by the same amount for
+the whole directory, and that amount is found by lining up its shooting
+activity with the reference photos: people photograph the same moments, so
+the right shift makes the photos of both land close together. This needs the
+cameras to have been together for at least a handful of moments and is
+usually right to within a minute; photos of the very same moment make it
+more precise. The confidence is high when no other shift explains the photos
+nearly as well. Check a few photos before applying a low-confidence
+suggestion.
+
+The search covers ±12 hours; `--max-offset` changes that. Much more than
+half a day and the previous or next day's activity starts to look like a
+match. Suggestions are relative to the effective timestamps, so a camera that
+was already shifted correctly shows `none`.
+
+Phones are recognised by their `Make` and `Model`. GPS times come from the
+image files only; photos geotagged afterwards from a track log carry a GPS
+time derived from the camera clock and prove nothing about it.
 
 ### Output for scripts
 

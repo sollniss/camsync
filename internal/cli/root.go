@@ -105,6 +105,7 @@ Settings can also come from ` + configHint() + ` or from
 environment variables such as ` + config.EnvPrefix + `_SIDECAR_STYLE. Flags
 override both.`,
 		Example: `  camsync list ~/Photos/trip
+  camsync suggest ~/Photos/trip
   camsync shift --camera sony --by 2m30s ~/Photos/trip
   camsync shift --camera 2 --timezone +02:00 --dry-run ~/Photos/trip
   camsync reset --camera sony ~/Photos/trip`,
@@ -148,7 +149,7 @@ override both.`,
 		panic(err)
 	}
 
-	root.AddCommand(rt.listCommand(), rt.shiftCommand(), rt.resetCommand())
+	root.AddCommand(rt.listCommand(), rt.suggestCommand(), rt.shiftCommand(), rt.resetCommand())
 	return rt, root
 }
 
