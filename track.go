@@ -20,26 +20,28 @@ const (
 	DefaultBridgeDistance = 1000 // metres
 )
 
-// PositionObservation is a photo with a measured position at a known moment.
+// PositionObservation is a measured position at a known moment: a photo
+// with GPS data, or a point of a GPS track.
 type PositionObservation struct {
 	Instant time.Time // UTC
 	Position
-	Photo *Photo
+	Source string // the photo's path, or the track file
 }
 
-// Track is the measured positions of a set of photos, the evidence
-// PlanGeotag places other photos with, kept as one path per camera: a
-// position between two photos is only plausible along the path of one
-// device, not between two people photographing in different places.
-// Positions camsync estimated are never part of it.
+// Track is the measured positions the evidence PlanGeotag places other
+// photos with, kept as one path per device: a position between two
+// observations is only plausible along the path of one device, not between
+// two people photographing in different places. Positions camsync estimated
+// are never part of it.
 type Track struct {
-	paths [][]PositionObservation // per camera, by instant
+	paths [][]PositionObservation // per device, by instant
 }
 
 // Track collects the photos of all cameras that have a measured position.
 // A photo's moment is its GPS time when it has one, since the position was
 // fixed then, and otherwise the moment its camera's clock says (see
-// Clocks.Instant), so run shift for clock errors first.
+// Clocks.Instant), so run shift for clock errors first. GPS tracks are
+// added with Track.Add.
 func (c *Clocks) Track() *Track {
 	t := &Track{}
 	for i := range c.Cameras {
@@ -56,15 +58,23 @@ func (c *Clocks) Track() *Track {
 				instant, ok = c.Instant(e, p)
 			}
 			if ok {
-				path = append(path, PositionObservation{Instant: instant, Position: *p.Position, Photo: p})
+				path = append(path, PositionObservation{Instant: instant, Position: *p.Position, Source: p.Path})
 			}
 		}
-		if len(path) > 0 {
-			slices.SortStableFunc(path, func(a, b PositionObservation) int { return a.Instant.Compare(b.Instant) })
-			t.paths = append(t.paths, path)
-		}
+		t.Add(path)
 	}
 	return t
+}
+
+// Add adds the path of one device: its observations, in any order. Empty
+// paths are ignored.
+func (t *Track) Add(path []PositionObservation) {
+	if len(path) == 0 {
+		return
+	}
+	path = slices.Clone(path)
+	slices.SortStableFunc(path, func(a, b PositionObservation) int { return a.Instant.Compare(b.Instant) })
+	t.paths = append(t.paths, path)
 }
 
 // Len returns the number of observations.
@@ -81,6 +91,10 @@ type TrackOptions struct {
 	MaxGap         time.Duration
 	MaxBridge      time.Duration
 	BridgeDistance float64 // metres
+	// MaxDistance, if positive, refuses to interpolate between observations
+	// further apart than this many metres; the nearest one within MaxGap is
+	// copied instead. Zero sets no limit.
+	MaxDistance float64
 }
 
 func (o TrackOptions) withDefaults() TrackOptions {
@@ -105,16 +119,21 @@ type Fix struct {
 	// Interpolated reports that the position lies between two observations;
 	// otherwise it is copied from the nearest one.
 	Interpolated bool
-	From         *Photo // the observation before, or the one copied
-	To           *Photo // the observation after, when interpolated
+	// Distance is how far apart, in metres, the two observations of an
+	// interpolated position are: the room the true position had to stray
+	// from the line between them. It is zero for a copied position.
+	Distance float64
+	From     string // source of the observation before, or the one copied
+	To       string // source of the observation after, when interpolated
 }
 
-// At estimates the position at instant from the path of every camera and
+// At estimates the position at instant from the path of every device and
 // returns the estimate that reaches least far in time. Along one path, the
 // position is interpolated between the observation before and the one after
 // when both are within MaxGap, or both within MaxBridge and no more than
-// BridgeDistance apart; otherwise the nearest observation within MaxGap is
-// copied. It reports false when no path has one.
+// BridgeDistance apart, unless they are more than MaxDistance apart;
+// otherwise the nearest observation within MaxGap is copied. It reports
+// false when no path has one.
 func (t *Track) At(instant time.Time, opts TrackOptions) (Fix, bool) {
 	opts = opts.withDefaults()
 	var best Fix
@@ -137,15 +156,16 @@ func pathAt(path []PositionObservation, instant time.Time, opts TrackOptions) (F
 		next = &path[k]
 	}
 	if next != nil && next.Instant.Equal(instant) {
-		return Fix{Position: next.Position, From: next.Photo}, true
+		return Fix{Position: next.Position, From: next.Source}, true
 	}
 	if prev != nil && next != nil {
 		dp, dn := instant.Sub(prev.Instant), next.Instant.Sub(instant)
+		dist := prev.DistanceTo(next.Position)
 		near := dp <= opts.MaxGap && dn <= opts.MaxGap
-		bridge := dp <= opts.MaxBridge && dn <= opts.MaxBridge && prev.DistanceTo(next.Position) <= opts.BridgeDistance
-		if near || bridge {
+		bridge := dp <= opts.MaxBridge && dn <= opts.MaxBridge && dist <= opts.BridgeDistance
+		if (near || bridge) && (opts.MaxDistance <= 0 || dist <= opts.MaxDistance) {
 			f := float64(dp) / float64(dp+dn)
-			return Fix{Position: prev.Towards(next.Position, f), Gap: max(dp, dn), Interpolated: true, From: prev.Photo, To: next.Photo}, true
+			return Fix{Position: prev.Towards(next.Position, f), Gap: max(dp, dn), Interpolated: true, Distance: dist, From: prev.Source, To: next.Source}, true
 		}
 	}
 	var best *PositionObservation
@@ -160,5 +180,5 @@ func pathAt(path []PositionObservation, instant time.Time, opts TrackOptions) (F
 	if best == nil {
 		return Fix{}, false
 	}
-	return Fix{Position: best.Position, Gap: gap, From: best.Photo}, true
+	return Fix{Position: best.Position, Gap: gap, From: best.Source}, true
 }

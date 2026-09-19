@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -88,6 +89,7 @@ type fixView struct {
 	Lon          float64 `json:"lon"`
 	Gap          string  `json:"gap"`
 	Interpolated bool    `json:"interpolated"`
+	Distance     float64 `json:"distance,omitempty"` // metres between the observations interpolated between
 	From         string  `json:"from"`
 	To           string  `json:"to,omitempty"`
 }
@@ -95,13 +97,7 @@ type fixView struct {
 func entryJSON(e app.Entry) entryView {
 	v := entryView{Path: e.Path, Action: e.Action, Before: e.Before, After: e.After, Sidecar: e.Sidecar, Reason: e.Reason}
 	if f := e.Fix; f != nil {
-		v.Fix = &fixView{Lat: f.Lat, Lon: f.Lon, Gap: camsync.FormatSpan(f.Gap), Interpolated: f.Interpolated}
-		if f.From != nil {
-			v.Fix.From = f.From.Path
-		}
-		if f.To != nil {
-			v.Fix.To = f.To.Path
-		}
+		v.Fix = &fixView{Lat: f.Lat, Lon: f.Lon, Gap: camsync.FormatSpan(f.Gap), Interpolated: f.Interpolated, Distance: math.Round(f.Distance), From: f.From, To: f.To}
 	}
 	return v
 }
@@ -245,10 +241,20 @@ type suggestionView struct {
 	Basis      string         `json:"basis,omitempty"`
 	ClockZone  *clockZoneView `json:"clockZone"`
 	Shift      *string        `json:"shift"`
+	Spread     string         `json:"spread,omitempty"`
 	Confidence string         `json:"confidence,omitempty"`
 	Matched    int            `json:"matched"`
 	GPS        *gpsView       `json:"gps"`
+	Days       []dayView      `json:"days,omitempty"`
+	Unstable   bool           `json:"unstable"`
 	Note       string         `json:"note,omitempty"`
+}
+
+type dayView struct {
+	Day        string `json:"day"`
+	Shift      string `json:"shift"`
+	Matched    int    `json:"matched"`
+	Confidence string `json:"confidence"`
 }
 
 type suggestJSON struct {
@@ -290,7 +296,14 @@ func suggestView(res *app.SuggestResult) suggestJSON {
 		if c.Found {
 			s := camsync.FormatDuration(c.Offset)
 			sv.Shift = &s
+			if c.Matched >= camsync.MinSpreadPhotos && c.Basis == camsync.BasisActivity {
+				sv.Spread = camsync.FormatSpan(c.Spread)
+			}
 		}
+		for _, d := range c.Days {
+			sv.Days = append(sv.Days, dayView{Day: d.Day, Shift: camsync.FormatDuration(d.Offset), Matched: d.Matched, Confidence: string(d.Confidence)})
+		}
+		sv.Unstable = c.Unstable
 		if g := c.GPS; g != nil {
 			sv.GPS = &gpsView{Photos: g.Photos, Error: camsync.FormatDuration(g.Error), Zone: camsync.FormatZone(g.Zone), ZoneInferred: g.ZoneInferred}
 		}
@@ -337,7 +350,10 @@ func printSuggest(w io.Writer, res *app.SuggestResult, shiftArgs []string) error
 			args[i] = shellQuote(a)
 		}
 		line := "  " + strings.Join(args, " ")
-		if c.Confidence == camsync.ConfidenceLow {
+		switch {
+		case c.Unstable:
+			line += "  # the clock changed during the trip; see the notes"
+		case c.Confidence == camsync.ConfidenceLow:
 			line += "  # low confidence: compare a few photos first"
 		}
 		cmds = append(cmds, line)
@@ -363,7 +379,18 @@ func suggestNotes(c app.Suggestion) string {
 	case c.Basis == camsync.BasisGPS:
 		parts = append(parts, fmt.Sprintf("measured against GPS time in %d photos", c.Matched))
 	case c.Basis == camsync.BasisActivity:
-		parts = append(parts, fmt.Sprintf("%d photos within %s of a reference photo", c.Matched, camsync.FormatSpan(camsync.MatchWindow)))
+		note := fmt.Sprintf("%d photos within %s of a reference photo", c.Matched, camsync.FormatSpan(camsync.MatchWindow))
+		if c.Matched >= camsync.MinSpreadPhotos {
+			note += " (±" + camsync.FormatSpan(c.Spread) + ")"
+		}
+		parts = append(parts, note)
+		if changed := c.ChangedDays(); len(changed) > 0 {
+			days := make([]string, 0, len(changed))
+			for _, d := range changed {
+				days = append(days, d.Day+" "+camsync.FormatDuration(d.Offset))
+			}
+			parts = append(parts, "clock changed during the trip: "+strings.Join(days, ", "))
+		}
 	case c.Note == camsync.NoteReferenceZoneUnknown:
 		parts = append(parts, c.Note+"; set one with --clock-zone")
 	case c.Note != "":

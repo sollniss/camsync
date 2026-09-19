@@ -2,7 +2,9 @@ package camsync
 
 import (
 	"cmp"
+	"maps"
 	"math"
+	"math/rand/v2"
 	"regexp"
 	"slices"
 	"sort"
@@ -219,7 +221,43 @@ type ClockEstimate struct {
 	Offset     time.Duration
 	Matched    int // photos that support the estimate
 	Confidence Confidence
-	Note       string // why nothing was found
+	// Spread is the uncertainty of an offset found by activity: see
+	// Alignment.Spread. It is zero when Matched is below MinSpreadPhotos.
+	Spread time.Duration
+	Note   string // why nothing was found
+
+	// Days holds the offset of each day's photos aligned on their own, for
+	// a camera aligned by activity whose photos span several days. Unstable
+	// is set when a day found with high confidence disagrees with Offset by
+	// more than DayOffsetTolerance: the clock was changed during the trip,
+	// so no single shift is right for all photos.
+	Days     []DayOffset
+	Unstable bool
+}
+
+// DayOffset is the offset found for the photos of one day alone.
+type DayOffset struct {
+	Day        string // the camera's wall-clock date, 2006-01-02
+	Offset     time.Duration
+	Matched    int
+	Confidence Confidence
+}
+
+// DayOffsetTolerance is how far a day's own offset may differ from the
+// camera's before the clock counts as changed. Clock drift within a trip is
+// seconds; a reset, a DST switch or a battery pull is minutes or hours.
+const DayOffsetTolerance = 5 * time.Minute
+
+// ChangedDays returns the days whose offset, found with high confidence,
+// differs from Offset by more than DayOffsetTolerance.
+func (e *ClockEstimate) ChangedDays() []DayOffset {
+	var out []DayOffset
+	for _, d := range e.Days {
+		if d.Confidence == ConfidenceHigh && (d.Offset-e.Offset).Abs() > DayOffsetTolerance {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // The notes EstimateClocks gives when it cannot estimate a clock. The
@@ -281,13 +319,18 @@ func (c *Clocks) Instant(e *ClockEstimate, p *Photo) (time.Time, bool) {
 
 // instants returns the instants of the camera's photos that have one.
 func (c *Clocks) instants(e *ClockEstimate) []time.Time {
-	var ts []time.Time
+	_, ts := c.timed(e)
+	return ts
+}
+
+// timed returns the camera's photos that have an instant, with the instants.
+func (c *Clocks) timed(e *ClockEstimate) (photos []*Photo, ts []time.Time) {
 	for _, p := range e.Group.Photos {
 		if t, ok := c.Instant(e, p); ok {
-			ts = append(ts, t)
+			photos, ts = append(photos, p), append(ts, t)
 		}
 	}
-	return ts
+	return photos, ts
 }
 
 // EstimateClocks judges the clock of every group, in the order given.
@@ -404,19 +447,22 @@ func (c *Clocks) judge(e *ClockEstimate, ref []time.Time, hasReference bool) {
 	case len(ref) == 0:
 		e.Note = NoteNoReference
 	case e.ClockZone.Known() || c.WallClocks:
-		a, ok := Align(ref, c.instants(e), c.MaxOffset)
+		photos, times := c.timed(e)
+		a, ok := Align(ref, times, c.MaxOffset)
 		if !ok {
 			e.Note = "no reference photos within " + FormatSpan(c.MaxOffset)
 			break
 		}
-		e.Found, e.Basis, e.Offset, e.Matched, e.Confidence = true, BasisActivity, a.Offset, a.Matched, a.Confidence
+		e.aligned(a, 0)
+		c.checkDays(e, ref, photos, times, c.MaxOffset, 0)
 	default:
 		// Read the wall clock as UTC: the offset found is the clock
 		// zone, negated, plus the clock error.
+		var photos []*Photo
 		var walls []time.Time
 		for _, p := range e.Group.Photos {
 			if p.Original != nil {
-				walls = append(walls, p.Original.T)
+				photos, walls = append(photos, p), append(walls, p.Original.T)
 			}
 		}
 		search := max(c.MaxOffset, 14*time.Hour)
@@ -427,8 +473,37 @@ func (c *Clocks) judge(e *ClockEstimate, ref []time.Time, hasReference bool) {
 		}
 		z := nearestZone(-a.Offset, c.Timeline.Zones())
 		e.ClockZone = ClockZone{z, ZoneFromActivity}
-		e.Found, e.Basis, e.Offset, e.Matched, e.Confidence = true, BasisActivity, a.Offset+z, a.Matched, a.Confidence
+		e.aligned(a, z)
+		c.checkDays(e, ref, photos, walls, search, z)
 	}
+}
+
+// aligned records an activity alignment, adjust being what the offset found
+// owes to reading the wall clock as UTC.
+func (e *ClockEstimate) aligned(a Alignment, adjust time.Duration) {
+	e.Found, e.Basis, e.Offset, e.Matched, e.Confidence, e.Spread = true, BasisActivity, a.Offset+adjust, a.Matched, a.Confidence, a.Spread
+}
+
+// checkDays aligns the photos of each wall-clock day on their own, the way
+// the camera as a whole was aligned, and records the outcome in e.Days. A
+// clock reset or a DST switch during the trip shows up as a day that
+// confidently disagrees with the camera's offset (see ChangedDays), where a
+// single shift would be wrong for part of the photos.
+func (c *Clocks) checkDays(e *ClockEstimate, ref []time.Time, photos []*Photo, times []time.Time, search, adjust time.Duration) {
+	byDay := map[string][]time.Time{}
+	for i, p := range photos {
+		day := p.Original.T.Format(time.DateOnly)
+		byDay[day] = append(byDay[day], times[i])
+	}
+	if len(byDay) < 2 {
+		return
+	}
+	for _, day := range slices.Sorted(maps.Keys(byDay)) {
+		if a, ok := Align(ref, byDay[day], search); ok {
+			e.Days = append(e.Days, DayOffset{day, a.Offset + adjust, a.Matched, a.Confidence})
+		}
+	}
+	e.Unstable = len(e.ChangedDays()) > 0
 }
 
 // nearestZone returns the whole hour or one of the known zones nearest to d.
@@ -493,12 +568,22 @@ type Alignment struct {
 	Offset     time.Duration // amount to add to the camera's timestamps
 	Matched    int           // camera photos within MatchWindow of a reference photo after the shift
 	Confidence Confidence
+	// Spread is how far the matched photos alone allow Offset to move: half
+	// the width of the 90% interval of the refinement over resamples of
+	// them. It is only estimated when at least MinSpreadPhotos matched, and
+	// zero otherwise.
+	Spread time.Duration
 }
 
 const (
 	alignStep  = 30 * time.Second // grid of the coarse search
 	alignWidth = 5 * time.Minute  // tolerance of the coarse search
 	burstGap   = time.Minute      // photos closer than this form one burst
+
+	// MinSpreadPhotos is the number of matched photos Align needs to
+	// estimate the spread of an offset.
+	MinSpreadPhotos = 3
+	spreadSamples   = 100
 )
 
 // Align finds the shift of the camera times cam, within ±maxOffset, that
@@ -513,7 +598,8 @@ const (
 // photos, where photos of the very same moment form a tight cluster.
 //
 // Confidence compares the best score with the strongest rival peak, both
-// measured above the average score, which is what unrelated photos reach.
+// measured above the average score of the shifts that bring the two sets
+// of photos to overlap at all, which is what unrelated photos reach.
 func Align(ref, cam []time.Time, maxOffset time.Duration) (Alignment, bool) {
 	if len(ref) == 0 || len(cam) == 0 {
 		return Alignment{}, false
@@ -555,18 +641,26 @@ func Align(ref, cam []time.Time, maxOffset time.Duration) (Alignment, bool) {
 	step, width, limit := alignStep.Seconds(), alignWidth.Seconds(), maxOffset.Seconds()
 	n := int(limit / step)
 	scores := make([]float64, 2*n+1)
-	best, mean := n, 0.0
+	// Shifts that keep the two sets of photos apart score zero by
+	// construction and say nothing about how unrelated photos fare, so they
+	// stay out of the baseline; a short overlap would otherwise look sure.
+	overlapLo, overlapHi := r[0]-c[len(c)-1]-width, r[len(r)-1]-c[0]+width
+	best, mean, overlapping := n, 0.0, 0
 	for i := range scores {
-		scores[i] = score(float64(i-n)*step, width)
-		mean += scores[i]
+		shift := float64(i-n) * step
+		scores[i] = score(shift, width)
+		if shift >= overlapLo && shift <= overlapHi {
+			mean += scores[i]
+			overlapping++
+		}
 		if scores[i] > scores[best] || (scores[i] == scores[best] && abs(i-n) < abs(best-n)) {
 			best = i
 		}
 	}
-	mean /= float64(len(scores))
 	if scores[best] == 0 {
 		return Alignment{}, false
 	}
+	mean /= float64(overlapping) // a positive score implies an overlapping shift
 	shift := float64(best-n) * step
 	for _, win := range []float64{120, 30} {
 		shift += refine(c, w, residual, shift, win)
@@ -574,10 +668,15 @@ func Align(ref, cam []time.Time, maxOffset time.Duration) (Alignment, bool) {
 	shift = math.Round(shift)
 
 	a := Alignment{Offset: time.Duration(shift) * time.Second}
-	for _, x := range c {
-		if math.Abs(residual(x+shift)) <= MatchWindow.Seconds() {
-			a.Matched++
+	var matched []res
+	for i, x := range c {
+		if d := residual(x + shift); math.Abs(d) <= MatchWindow.Seconds() {
+			matched = append(matched, res{d, w[i]})
 		}
+	}
+	a.Matched = len(matched)
+	if a.Matched >= MinSpreadPhotos {
+		a.Spread = time.Duration(math.Round(spread(matched, MatchWindow.Seconds()/4))) * time.Second
 	}
 	// A rival is another peak that the scores fall well below on the way from
 	// the best one, so the shoulders of the best peak do not count: long,
@@ -608,11 +707,18 @@ func Align(ref, cam []time.Time, maxOffset time.Duration) (Alignment, bool) {
 	return a, true
 }
 
+// res is the signed distance of a camera photo to the nearest reference
+// photo, with the photo's burst weight.
+type res struct{ d, w float64 }
+
+func sortResiduals(rs []res) {
+	slices.SortFunc(rs, func(a, b res) int { return cmp.Compare(a.d, b.d) })
+}
+
 // refine returns the correction to shift suggested by the camera photos that
 // are within win seconds of a reference photo: the weighted median of the
 // residuals around their densest point.
 func refine(c, w []float64, residual func(float64) float64, shift, win float64) float64 {
-	type res struct{ d, w float64 }
 	var rs []res
 	for i, x := range c {
 		if d := residual(x + shift); math.Abs(d) <= win {
@@ -622,36 +728,72 @@ func refine(c, w []float64, residual func(float64) float64, shift, win float64) 
 	if len(rs) == 0 {
 		return 0
 	}
-	band := win / 4
+	sortResiduals(rs)
+	return modeMedian(rs, win/4)
+}
+
+// modeMedian returns the weighted median of the residuals within band of
+// their densest point, density being a triangular kernel of that width. rs
+// must be sorted by distance. Prefix sums make every kernel evaluation a
+// subtraction, so the whole pass is linear once sorted.
+func modeMedian(rs []res, band float64) float64 {
+	n := len(rs)
+	pw, pwd := make([]float64, n+1), make([]float64, n+1) // weights, and weights times distance
+	for i, r := range rs {
+		pw[i+1], pwd[i+1] = pw[i]+r.w, pwd[i]+r.w*r.d
+	}
 	mode, top := 0.0, -1.0
-	for _, a := range rs {
-		density := 0.0
-		for _, b := range rs {
-			if d := math.Abs(a.d - b.d); d < band {
-				density += b.w * (1 - d/band)
-			}
+	lo, hi := 0, 0 // the window of residuals strictly within band of rs[i]
+	for i, a := range rs {
+		for rs[lo].d <= a.d-band {
+			lo++
 		}
-		if density > top {
+		for hi < n && rs[hi].d < a.d+band {
+			hi++
+		}
+		// Residuals up to a pull the kernel down by a.d-b.d, those after by b.d-a.d.
+		wl, wdl := pw[i+1]-pw[lo], pwd[i+1]-pwd[lo]
+		wr, wdr := pw[hi]-pw[i+1], pwd[hi]-pwd[i+1]
+		if density := wl + wr - (a.d*wl-wdl+wdr-a.d*wr)/band; density > top {
 			mode, top = a.d, density
 		}
 	}
-	var near []res
-	total := 0.0
-	for _, a := range rs {
+	first, total := n, 0.0
+	for i, a := range rs {
 		if math.Abs(a.d-mode) <= band {
-			near = append(near, a)
+			first = min(first, i)
 			total += a.w
 		}
 	}
-	slices.SortFunc(near, func(a, b res) int { return cmp.Compare(a.d, b.d) })
 	acc := 0.0
-	for _, a := range near {
+	for _, a := range rs[first:] {
+		if a.d > mode+band {
+			break
+		}
 		acc += a.w
 		if acc >= total/2 {
 			return a.d
 		}
 	}
 	return mode
+}
+
+// spread estimates how far the matched photos alone allow the correction to
+// move: half the width of the 90% interval of modeMedian over resamples of
+// the residuals. The resampling is seeded from the data, so it repeats.
+func spread(rs []res, band float64) float64 {
+	rng := rand.New(rand.NewPCG(uint64(len(rs)), math.Float64bits(rs[0].d)))
+	sample := make([]res, len(rs))
+	ests := make([]float64, spreadSamples)
+	for b := range ests {
+		for i := range sample {
+			sample[i] = rs[rng.IntN(len(rs))]
+		}
+		sortResiduals(sample)
+		ests[b] = modeMedian(sample, band)
+	}
+	slices.Sort(ests)
+	return (ests[spreadSamples*95/100-1] - ests[spreadSamples*5/100]) / 2
 }
 
 // burstWeights gives each of the sorted times the weight 1/len(burst), where

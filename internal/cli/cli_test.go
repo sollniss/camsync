@@ -564,7 +564,7 @@ func TestGeotagFlow(t *testing.T) {
 	}
 
 	code, out, _ = run(t, "geotag", "-v", "-c", "canon", dir)
-	if code != 0 || !strings.Contains(out, "create  "+filepath.Join(dir, "CAN_002.JPG")+": 54.4018000, 13.4300000 (between IMG_0.JPG and IMG_1.JPG, 2m)  (CAN_002.JPG.xmp)") {
+	if code != 0 || !strings.Contains(out, "create  "+filepath.Join(dir, "CAN_002.JPG")+": 54.4018000, 13.4300000 (between IMG_0.JPG and IMG_1.JPG, 2m, 400m apart)  (CAN_002.JPG.xmp)") {
 		t.Errorf("geotag: %d\n%s", code, out)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, "CAN_002.JPG.xmp"))

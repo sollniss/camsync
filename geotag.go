@@ -48,32 +48,43 @@ func (c *Clocks) PlanGeotag(e *ClockEstimate, p *Photo, track *Track, opts Track
 }
 
 // String describes the fix for people: "54.4250000, 13.4350000 (between
-// IMG_0001.JPG and IMG_0002.JPG, 2m)".
+// IMG_0001.JPG and IMG_0002.JPG, 2m, 130m apart)", or "(along track.gpx,
+// 4s, 12m apart)" for a position on a GPS track.
 func (f Fix) String() string {
 	var b strings.Builder
 	b.WriteString(f.Position.String())
 	b.WriteString(" (")
-	if f.Interpolated {
+	switch {
+	case f.Interpolated && f.From == f.To:
+		b.WriteString("along ")
+		b.WriteString(baseName(f.From))
+	case f.Interpolated:
 		b.WriteString("between ")
-		b.WriteString(photoName(f.From))
+		b.WriteString(baseName(f.From))
 		b.WriteString(" and ")
-		b.WriteString(photoName(f.To))
-	} else {
+		b.WriteString(baseName(f.To))
+	default:
 		b.WriteString("from ")
-		b.WriteString(photoName(f.From))
+		b.WriteString(baseName(f.From))
 	}
 	b.WriteString(", ")
 	b.WriteString(FormatSpan(f.Gap))
+	if f.Interpolated {
+		b.WriteString(", ")
+		b.WriteString(FormatDistance(f.Distance))
+		b.WriteString(" apart")
+	}
 	b.WriteByte(')')
 	return b.String()
 }
 
-func photoName(p *Photo) string {
-	if p == nil {
+// baseName returns the last element of a path in either slash convention.
+func baseName(path string) string {
+	if path == "" {
 		return "?"
 	}
-	if i := strings.LastIndexAny(p.Path, `/\`); i >= 0 {
-		return p.Path[i+1:]
+	if i := strings.LastIndexAny(path, `/\`); i >= 0 {
+		return path[i+1:]
 	}
-	return p.Path
+	return path
 }

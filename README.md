@@ -22,7 +22,7 @@ camsync list     [DIR] [-v] [-r] [-o table|json]
 camsync suggest  [DIR] [--reference NAME]... [--clock-zone NAME=ZONE]... [--max-offset DURATION]
 camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
 camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--zone-gap DURATION] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
-camsync geotag   [DIR] [--camera NAME] [--max-gap DURATION] [--max-bridge DURATION] [--dry-run] [-v]
+camsync geotag   [DIR] [--camera NAME] [--gpx FILE]... [--max-gap DURATION] [--max-bridge DURATION] [--max-distance METRES] [--dry-run] [-v]
 camsync reset    [DIR] --camera NAME [--dry-run]
 ```
 
@@ -92,8 +92,15 @@ the right shift makes the photos of both land close together. This needs the
 cameras to have been together for at least a handful of moments and is
 usually right to within a minute; photos of the very same moment make it
 more precise. The confidence is high when no other shift explains the photos
-nearly as well. Check a few photos before applying a low-confidence
+nearly as well; the `±` in the notes says how far the matched photos alone
+let the estimate move. Check a few photos before applying a low-confidence
 suggestion.
+
+A camera whose photos span several days is also aligned day by day. When a
+day disagrees with the rest with high confidence, the clock was changed
+during the trip (a reset, a DST switch, a battery pull) and the notes say
+so with the offset of each such day: apply the shift to the affected photos
+separately, in their own directory.
 
 The search covers ±12 hours; `--max-offset` changes that. Much more than
 half a day and the previous or next day's activity starts to look like a
@@ -187,8 +194,17 @@ in a quarter of an hour was there in between. Otherwise the nearest located
 photo within `--max-gap` is copied. No position is ever made up between the
 photos of two different cameras, which may have been in different places.
 When several cameras could place a photo, the estimate reaching least far in
-time wins. MEDIAN GAP and MAX GAP show how far the written estimates reach;
-`-v` lists every photo with the photos its position comes from.
+time wins. MEDIAN GAP and MAX GAP show how far in time the written estimates
+reach, MAX DIST how far apart the two photos an estimate lies between were,
+which bounds how far the true position can be from the line between them;
+`--max-distance 500m` refuses to interpolate beyond that and copies the
+nearest photo instead. `-v` lists every photo with the photos its position
+comes from.
+
+A GPS track recorded with a watch or a tracking app places photos far more
+densely than located photos can: `--gpx track.gpx`, repeated for several
+files, adds its points as evidence under the same rules, so most photos
+land within seconds of a track point.
 
 A located photo's moment is its GPS time; every other photo's moment comes
 from its camera's clock and clock zone, as for `localize`. Run `suggest` and

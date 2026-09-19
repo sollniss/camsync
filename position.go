@@ -1,6 +1,7 @@
 package camsync
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
@@ -16,6 +17,32 @@ type Position struct {
 // String renders the position as "54.4250000, 13.4350000".
 func (p Position) String() string {
 	return strconv.FormatFloat(p.Lat, 'f', 7, 64) + ", " + strconv.FormatFloat(p.Lon, 'f', 7, 64)
+}
+
+// FormatDistance renders metres as "130m" or "12.5km".
+func FormatDistance(m float64) string {
+	if m < 1000 {
+		return strconv.FormatFloat(math.Round(m), 'f', 0, 64) + "m"
+	}
+	return strings.TrimSuffix(strconv.FormatFloat(m/1000, 'f', 1, 64), ".0") + "km"
+}
+
+// ParseDistance parses a distance such as "500", "500m" or "1.5km" into
+// metres.
+func ParseDistance(v string) (float64, error) {
+	s := strings.TrimSpace(strings.ToLower(v))
+	scale := 1.0
+	switch {
+	case strings.HasSuffix(s, "km"):
+		s, scale = strings.TrimSuffix(s, "km"), 1000
+	case strings.HasSuffix(s, "m"):
+		s = strings.TrimSuffix(s, "m")
+	}
+	m, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(m) || math.IsInf(m, 0) || m < 0 {
+		return 0, fmt.Errorf("invalid distance %q (use forms like 500, 500m, 1.5km)", v)
+	}
+	return m * scale, nil
 }
 
 // DistanceTo returns the great-circle distance to o in metres.

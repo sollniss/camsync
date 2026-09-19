@@ -288,3 +288,89 @@ func TestNearestZone(t *testing.T) {
 		}
 	}
 }
+
+func TestAlignSpread(t *testing.T) {
+	rng := rand.New(rand.NewPCG(9, 10))
+	ref, cam := simulateTrip(rng, 3, 0.8, 0.7)
+	a, ok := Align(ref, shifted(cam, -7*time.Minute), DefaultMaxOffset)
+	if !ok || a.Matched < MinSpreadPhotos {
+		t.Fatalf("alignment = %+v %v", a, ok)
+	}
+	// People press the shutter a minute or two apart, so the spread is
+	// seconds to a minute; it must not be zero or absurd.
+	if a.Spread <= 0 || a.Spread > 2*time.Minute {
+		t.Errorf("spread = %v", a.Spread)
+	}
+	// Photos of the very same moments pin the offset down to a second.
+	var exactRef, exactCam []time.Time
+	for i := range 12 {
+		at := tripStart.Add(time.Duration(i) * time.Hour)
+		exactRef = append(exactRef, at)
+		exactCam = append(exactCam, at.Add(-10*time.Minute-time.Duration(i%3)*time.Second))
+	}
+	if a, ok := Align(exactRef, exactCam, time.Hour); !ok || a.Spread > 2*time.Second {
+		t.Errorf("exact moments: %+v %v", a, ok)
+	}
+	if a, ok := Align(exactRef[:2], exactCam[:2], time.Hour); !ok || a.Spread != 0 || a.Matched != 2 {
+		t.Errorf("too few photos for a spread: %+v %v", a, ok)
+	}
+}
+
+func TestEstimateClocksDetectsClockChange(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 12))
+	ref, cam := simulateTrip(rng, 4, 0.8, 0.7)
+	const local = 2 * time.Hour
+	phone := zonedGroup("Apple", "iPhone 15", ref, local, 0, "+02:00")
+	// The camera ran ten minutes slow, then someone set it an hour further
+	// off on the third day.
+	changed := &Group{Camera: "Canon EOS R5"}
+	for _, at := range cam {
+		err := -10 * time.Minute
+		if at.Sub(tripStart) >= 2*24*time.Hour {
+			err -= time.Hour
+		}
+		changed.Photos = append(changed.Photos, photoAt("Canon", "Canon EOS R5", at.Add(local+err), "+02:00", nil))
+	}
+	steady := zonedGroup("SONY", "ILCE-7M3", cam, local, 3*time.Minute, "+02:00")
+	est := EstimateClocks([]*Group{changed, steady, phone}, ClockOptions{}).Cameras
+
+	e := est[0]
+	if !e.Found || !e.Unstable || len(e.Days) != 4 {
+		t.Fatalf("changed camera = %+v", e)
+	}
+	// Whichever half the camera-wide offset landed on, days of the other
+	// half are reported with their own offset; only days found with high
+	// confidence raise the flag, so not every day of that half need appear.
+	changedDays := e.ChangedDays()
+	if len(changedDays) == 0 || len(changedDays) > 2 {
+		t.Fatalf("changed days = %+v (offset %v, days %+v)", changedDays, e.Offset, e.Days)
+	}
+	for _, d := range e.Days {
+		want := 10 * time.Minute
+		if d.Day >= "2024-05-03" {
+			want = 70 * time.Minute
+		}
+		if d.Confidence != ConfidenceLow && (d.Offset-want).Abs() > 3*time.Minute {
+			t.Errorf("day %s: offset %v, want about %v", d.Day, d.Offset, want)
+		}
+	}
+	for _, d := range changedDays {
+		if (d.Offset - e.Offset).Abs() < 50*time.Minute {
+			t.Errorf("changed day %s: offset %v is not the other half", d.Day, d.Offset)
+		}
+	}
+	if e := est[1]; !e.Found || e.Unstable || len(e.Days) != 4 || len(e.ChangedDays()) != 0 || (e.Offset+3*time.Minute).Abs() > 3*time.Minute {
+		t.Errorf("steady camera = %+v", e)
+	}
+	// A single day of photos has nothing to compare against.
+	var firstDay []time.Time
+	for _, at := range cam {
+		if at.Sub(tripStart) < 24*time.Hour {
+			firstDay = append(firstDay, at)
+		}
+	}
+	oneDay := zonedGroup("Nikon", "Z 6", firstDay, local, time.Minute, "+02:00")
+	if e := EstimateClocks([]*Group{oneDay, phone}, ClockOptions{}).Cameras[0]; e.Days != nil || e.Unstable {
+		t.Errorf("one day = %+v", e)
+	}
+}
