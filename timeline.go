@@ -32,11 +32,16 @@ type Timeline struct {
 	byWall    []ZoneObservation
 }
 
+// GPSZoneTolerance is how far the difference between a synced clock and GPS
+// time may be from the nearest quarter hour, the granularity of real zones,
+// and still be read as the zone. A larger remainder means the GPS fix is
+// stale, so the photo tells nothing about the zone.
+const GPSZoneTolerance = 2 * time.Minute
+
 // NewTimeline collects the observations from photos, which should come from
 // devices that follow the local zone. A photo counts when its effective
 // timestamp records a zone, or when it has a GPS time: a synced clock differs
-// from GPS time by the zone alone, which is rounded to 15 minutes to absorb a
-// stale GPS fix.
+// from GPS time by the zone alone (see GPSZoneTolerance).
 func NewTimeline(photos []*Photo) *Timeline {
 	t := &Timeline{}
 	for _, p := range photos {
@@ -58,8 +63,9 @@ func observe(p *Photo) (ZoneObservation, bool) {
 		return ZoneObservation{Instant: p.Original.T.Add(-z), Zone: z, Photo: p}, true
 	}
 	if p.GPSTime != nil {
-		z := p.Original.T.Sub(*p.GPSTime).Round(15 * time.Minute)
-		if z.Abs() <= 14*time.Hour {
+		d := p.Original.T.Sub(*p.GPSTime)
+		z := d.Round(15 * time.Minute)
+		if z.Abs() <= 14*time.Hour && (d-z).Abs() <= GPSZoneTolerance {
 			return ZoneObservation{Instant: p.Original.T.Add(-z), Zone: z, Photo: p}, true
 		}
 	}

@@ -11,7 +11,7 @@ import (
 )
 
 // ClockSettings are the inputs of the clock estimation shared by
-// SuggestQuery and LocalizeCommand.
+// SuggestQuery, LocalizeCommand and GeotagCommand.
 type ClockSettings struct {
 	// References are the trusted cameras, as printed by list: exact name, row
 	// number or unique substring. When empty, phones and cameras whose
@@ -54,12 +54,6 @@ func splitClockZone(v string) (camera string, zone time.Duration, err error) {
 // options resolves the settings against the scanned groups.
 func (s ClockSettings) options(groups []*camsync.Group) (camsync.ClockOptions, error) {
 	opts := camsync.ClockOptions{MaxOffset: s.MaxOffset, MaxZoneGap: s.MaxZoneGap}
-	if opts.MaxOffset == 0 {
-		opts.MaxOffset = camsync.DefaultMaxOffset
-	}
-	if opts.MaxZoneGap == 0 {
-		opts.MaxZoneGap = camsync.DefaultMaxZoneGap
-	}
 	for _, r := range s.References {
 		g, err := camsync.SelectGroup(groups, r)
 		if err != nil {
@@ -79,6 +73,39 @@ func (s ClockSettings) options(groups []*camsync.Group) (camsync.ClockOptions, e
 		opts.ClockZones[g] = zone
 	}
 	return opts, nil
+}
+
+// estimate scans the scope and estimates every camera's clock. It returns
+// the estimates of the cameras selected by camera, all of them in order when
+// it is empty; the other cameras still provide the evidence.
+func estimate(ctx context.Context, scope Scope, settings ClockSettings, camera string) (*camsync.Clocks, []*camsync.ClockEstimate, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	res, err := scope.scan(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	groups := camsync.GroupPhotos(res.Photos)
+	opts, err := settings.options(groups)
+	if err != nil {
+		return nil, nil, err
+	}
+	var only *camsync.Group
+	if camera != "" {
+		if only, err = camsync.SelectGroup(groups, camera); err != nil {
+			return nil, nil, invalid(err)
+		}
+	}
+	clocks := camsync.EstimateClocks(groups, opts)
+	if only != nil {
+		return clocks, []*camsync.ClockEstimate{clocks.Estimate(only)}, nil
+	}
+	selected := make([]*camsync.ClockEstimate, len(clocks.Cameras))
+	for i := range clocks.Cameras {
+		selected[i] = &clocks.Cameras[i]
+	}
+	return clocks, selected, nil
 }
 
 // SuggestQuery asks how far each camera's clock is off, measured against the
@@ -122,22 +149,13 @@ func (SuggestHandler) Handle(ctx context.Context, q SuggestQuery) (*SuggestResul
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	res, err := q.scan(ctx)
+	clocks, cameras, err := estimate(ctx, q.Scope, q.ClockSettings, "")
 	if err != nil {
 		return nil, err
 	}
-	groups := camsync.GroupPhotos(res.Photos)
-	opts, err := q.options(groups)
-	if err != nil {
-		return nil, err
-	}
-	clocks := camsync.EstimateClocks(groups, opts)
-	out := &SuggestResult{MaxOffset: opts.MaxOffset, WallClocks: clocks.WallClocks}
-	for i, e := range clocks.Cameras {
-		out.Cameras = append(out.Cameras, Suggestion{Index: i + 1, Name: e.Group.Camera, Files: len(e.Group.Photos), ClockEstimate: e})
+	out := &SuggestResult{MaxOffset: clocks.MaxOffset, WallClocks: clocks.WallClocks}
+	for i, e := range cameras {
+		out.Cameras = append(out.Cameras, Suggestion{Index: i + 1, Name: e.Group.Camera, Files: len(e.Group.Photos), ClockEstimate: *e})
 	}
 	return out, nil
 }

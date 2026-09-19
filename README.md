@@ -21,7 +21,7 @@ go build -o camsync ./cmd/camsync
 camsync list     [DIR] [-v] [-r] [-o table|json]
 camsync suggest  [DIR] [--reference NAME]... [--clock-zone NAME=ZONE]... [--max-offset DURATION]
 camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-run]
-camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
+camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--zone-gap DURATION] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
 camsync geotag   [DIR] [--camera NAME] [--max-gap DURATION] [--max-bridge DURATION] [--dry-run] [-v]
 camsync reset    [DIR] --camera NAME [--dry-run]
 ```
@@ -143,7 +143,7 @@ dry run: 535 sidecars written (168 new), 276 skipped (276 already local), 0 fail
 
 The local zone comes from the phones: the zone their photos record, or the
 difference between their clock and their GPS time. For each photo the phone
-photo closest in time decides, within `--max-gap` (default 24h), so trips
+photo closest in time decides, within `--zone-gap` (default 24h), so trips
 across zones and daylight saving changes come out right. A camera's own zone
 setting never counts as evidence. Where no phone photo is within reach,
 `--zone +02:00` sets the local zone; otherwise the photo is skipped.

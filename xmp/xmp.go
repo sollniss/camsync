@@ -2,7 +2,7 @@
 //
 // The package deliberately does not model RDF in full. Read collects the
 // simple properties of every rdf:Description, whether written as attributes
-// or as child elements with text content. Rewrite replaces or adds
+// or as child elements with text content. Update replaces or adds
 // properties and leaves everything else in the document intact: unrelated
 // elements, attributes, comments and processing instructions are written back
 // unchanged in content, so sidecars written by other tools keep their data.
@@ -191,15 +191,13 @@ func Read(data []byte) (Fields, error) {
 	return out, nil
 }
 
-// Rewrite returns data with the given fields set and nothing else changed in
-// content (see the package comment for how the output is serialised).
-// Fields already present (as attribute or element) are replaced in place;
-// missing ones are added in a new rdf:Description at the end of rdf:RDF.
-func Rewrite(data []byte, set Fields) ([]byte, error) { return Update(data, set, nil) }
-
-// Update is Rewrite that also removes the properties listed in remove from
-// every rdf:Description, whether written as attribute or as element. A field
-// both set and removed is set.
+// Update returns data with the given fields set, the properties listed in
+// remove taken out and nothing else changed in content (see the package
+// comment for how the output is serialised). Fields already present (as
+// attribute or element) are replaced in place; missing ones are added in a
+// new rdf:Description at the end of rdf:RDF. Removal covers every
+// rdf:Description, whether the property is written as attribute or as
+// element. A field both set and removed is set.
 func Update(data []byte, set Fields, remove []Field) ([]byte, error) {
 	bom := bytes.HasPrefix(data, utf8BOM)
 	toks, err := tokenize(bytes.TrimPrefix(data, utf8BOM))

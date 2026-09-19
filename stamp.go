@@ -27,6 +27,9 @@ func (s Stamp) Add(d time.Duration) Stamp {
 // Sub returns the wall-clock difference s - o.
 func (s Stamp) Sub(o Stamp) time.Duration { return s.T.Sub(o.T) }
 
+// Equal reports whether o records the same wall clock, fraction and zone.
+func (s Stamp) Equal(o Stamp) bool { return s.T.Equal(o.T) && s.Frac == o.Frac && s.TZ == o.TZ }
+
 // XMP formats the stamp as an XMP date: 2006-01-02T15:04:05[.frac][tz].
 func (s Stamp) XMP() string {
 	var b strings.Builder
@@ -185,16 +188,26 @@ func ParseXMPStamp(v string) (Stamp, bool) {
 // FormatDuration renders a shift compactly and always with a sign, such as
 // +2m30s or -1d2h. Zero renders as "none".
 func FormatDuration(d time.Duration) string {
-	if d == 0 {
+	switch {
+	case d == 0:
 		return "none"
+	case d < 0:
+		return "-" + formatSpan(-d)
 	}
-	sign := "+"
-	if d < 0 {
-		sign = "-"
-		d = -d
+	return "+" + formatSpan(d)
+}
+
+// FormatSpan renders a length of time without a sign, such as 2m30s or 1d,
+// for search ranges and gaps. Zero renders as "0s".
+func FormatSpan(d time.Duration) string {
+	if d == 0 {
+		return "0s"
 	}
+	return formatSpan(d.Abs())
+}
+
+func formatSpan(d time.Duration) string {
 	var b strings.Builder
-	b.WriteString(sign)
 	if days := d / (24 * time.Hour); days > 0 {
 		b.WriteString(strconv.FormatInt(int64(days), 10))
 		b.WriteByte('d')
@@ -210,7 +223,7 @@ func FormatDuration(d time.Duration) string {
 		b.WriteByte('m')
 		d -= m * time.Minute
 	}
-	if d > 0 || b.Len() == 1 {
+	if d > 0 || b.Len() == 0 {
 		b.WriteString(strconv.FormatFloat(d.Seconds(), 'g', -1, 64))
 		b.WriteByte('s')
 	}

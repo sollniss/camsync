@@ -16,6 +16,9 @@ func TestTimeline(t *testing.T) {
 		photoAt("Apple", "iPhone 15", day.Add(3*time.Hour+berlin+20*time.Second), "", gpsAt(day.Add(3*time.Hour))),
 		// Flew to Tokyo the next day.
 		photoAt("Apple", "iPhone 15", day.Add(24*time.Hour+9*time.Hour), "+09:00", nil),
+		// A GPS fix 20 minutes stale: off the quarter-hour grid, so it must
+		// not become a +02:15 observation.
+		photoAt("Apple", "iPhone 15", day.Add(6*time.Hour+berlin), "", gpsAt(day.Add(6*time.Hour-20*time.Minute))),
 		// Nothing to tell the zone.
 		photoAt("Apple", "iPhone 15", day.Add(5*time.Hour), "", nil),
 		{Camera: "undated"},

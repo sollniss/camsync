@@ -91,7 +91,7 @@ func TestRewriteAttributes(t *testing.T) {
 		CreateDate:        "2024-05-01T12:37:26",
 		DateCreated:       "2024-05-01T12:37:26",
 	}
-	out, err := Rewrite([]byte(lightroomXMP), set)
+	out, err := Update([]byte(lightroomXMP), set, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestRewriteAttributes(t *testing.T) {
 
 func TestRewriteElements(t *testing.T) {
 	set := Fields{DateTimeOriginal: "2024-05-01T12:37:26+02:00", CreateDate: "2024-05-01T12:37:26+02:00"}
-	out, err := Rewrite([]byte(exiftoolXMP), set)
+	out, err := Update([]byte(exiftoolXMP), set, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,10 +160,10 @@ func TestRewriteElements(t *testing.T) {
 }
 
 func TestRewriteErrors(t *testing.T) {
-	if _, err := Rewrite([]byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`), Fields{CreateDate: "x"}); err == nil {
+	if _, err := Update([]byte(`<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`), Fields{CreateDate: "x"}, nil); err == nil {
 		t.Error("expected error for document without rdf:RDF")
 	}
-	if _, err := Rewrite([]byte(`<broken`), Fields{CreateDate: "x"}); err == nil {
+	if _, err := Update([]byte(`<broken`), Fields{CreateDate: "x"}, nil); err == nil {
 		t.Error("expected error for malformed XML")
 	}
 }
@@ -190,7 +190,7 @@ func TestRewriteStrayEndTag(t *testing.T) {
 	// RawToken does not verify that tags match; a stray closing tag must
 	// produce an error, not a panic.
 	doc := `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="` + NSRDF + `"><rdf:Description/></rdf:RDF></x:xmpmeta></stray>`
-	if _, err := Rewrite([]byte(doc), Fields{CreateDate: "x"}); err == nil {
+	if _, err := Update([]byte(doc), Fields{CreateDate: "x"}, nil); err == nil {
 		t.Error("expected error for stray closing tag")
 	}
 }
@@ -199,7 +199,7 @@ func TestUpdateRemoves(t *testing.T) {
 	lat := Field{NSExif, "GPSLatitude"}
 	lon := Field{NSExif, "GPSLongitude"}
 	method := Field{NSExif, "GPSProcessingMethod"}
-	withGPS, err := Rewrite([]byte(exiftoolXMP), Fields{lat: "54,25.5N", lon: "13,26.1E", method: "camsync"})
+	withGPS, err := Update([]byte(exiftoolXMP), Fields{lat: "54,25.5N", lon: "13,26.1E", method: "camsync"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

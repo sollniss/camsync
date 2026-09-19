@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -94,7 +95,7 @@ type fixView struct {
 func entryJSON(e app.Entry) entryView {
 	v := entryView{Path: e.Path, Action: e.Action, Before: e.Before, After: e.After, Sidecar: e.Sidecar, Reason: e.Reason}
 	if f := e.Fix; f != nil {
-		v.Fix = &fixView{Lat: f.Lat, Lon: f.Lon, Gap: gapText(f.Gap), Interpolated: f.Interpolated}
+		v.Fix = &fixView{Lat: f.Lat, Lon: f.Lon, Gap: camsync.FormatSpan(f.Gap), Interpolated: f.Interpolated}
 		if f.From != nil {
 			v.Fix.From = f.From.Path
 		}
@@ -184,9 +185,9 @@ func printList(w io.Writer, res *app.ListResult, verbose bool) error {
 func printEntry(w io.Writer, e app.Entry) {
 	switch e.Action {
 	case app.ActionSkip:
-		fmt.Fprintf(w, "skip    %s: %s\n", e.Path, e.Reason)
+		fmt.Fprintf(w, "skip    %s: %s\n", e.Path, reasonText(e))
 	case app.ActionFail:
-		fmt.Fprintf(w, "FAILED  %s: %s\n", e.Path, e.Reason)
+		fmt.Fprintf(w, "FAILED  %s: %s\n", e.Path, reasonText(e))
 	default:
 		if e.Fix != nil {
 			fmt.Fprintf(w, "%-7s %s: %s  (%s)\n", e.Action, e.Path, e.Fix, filepath.Base(e.Sidecar))
@@ -194,6 +195,18 @@ func printEntry(w io.Writer, e app.Entry) {
 		}
 		fmt.Fprintf(w, "%-7s %s: %s -> %s  (%s)\n", e.Action, e.Path, stampText(e.Before), stampText(e.After), filepath.Base(e.Sidecar))
 	}
+}
+
+// reasonText is why a photo was skipped or failed, naming the flag that
+// resolves it where there is one.
+func reasonText(e app.Entry) string {
+	switch {
+	case errors.Is(e.Err, camsync.ErrClockZoneUnknown), errors.Is(e.Err, camsync.ErrClockZoneGuessed):
+		return e.Reason + "; set one with --clock-zone"
+	case errors.Is(e.Err, camsync.ErrNoLocalZone):
+		return e.Reason + "; set one with --zone"
+	}
+	return e.Reason
 }
 
 func printChangeSummary(w io.Writer, res *app.ChangeResult) {
@@ -350,7 +363,9 @@ func suggestNotes(c app.Suggestion) string {
 	case c.Basis == camsync.BasisGPS:
 		parts = append(parts, fmt.Sprintf("measured against GPS time in %d photos", c.Matched))
 	case c.Basis == camsync.BasisActivity:
-		parts = append(parts, fmt.Sprintf("%d photos within %s of a reference photo", c.Matched, strings.TrimPrefix(camsync.FormatDuration(camsync.MatchWindow), "+")))
+		parts = append(parts, fmt.Sprintf("%d photos within %s of a reference photo", c.Matched, camsync.FormatSpan(camsync.MatchWindow)))
+	case c.Note == camsync.NoteReferenceZoneUnknown:
+		parts = append(parts, c.Note+"; set one with --clock-zone")
 	case c.Note != "":
 		parts = append(parts, c.Note)
 	}
@@ -427,10 +442,11 @@ func printSkipReasons(w io.Writer, res app.ChangeResult) {
 		if e.Action != app.ActionSkip && e.Action != app.ActionFail {
 			continue
 		}
-		if reasons[e.Reason] == 0 {
-			order = append(order, e.Reason)
+		r := reasonText(e)
+		if reasons[r] == 0 {
+			order = append(order, r)
 		}
-		reasons[e.Reason]++
+		reasons[r]++
 	}
 	for _, r := range order {
 		fmt.Fprintf(w, "%s: %d %s\n", res.Camera, reasons[r], r)

@@ -80,6 +80,7 @@ type Entry struct {
 	Fix     *camsync.Fix   // position written by geotag
 	Sidecar string         // sidecar written, or that would be written
 	Reason  string         // why the photo was skipped or failed
+	Err     error          // the error behind Reason, for errors.Is
 }
 
 // ChangeResult is the outcome of a ShiftCommand or ResetCommand.
@@ -173,10 +174,10 @@ func (out *ChangeResult) run(
 		e := Entry{Path: p.Path, Before: p.Original, Sidecar: p.SidecarTarget}
 		ch, err := plan(p)
 		if err != nil {
-			e.Action, e.Reason = ActionSkip, err.Error()
+			e.Action, e.Reason, e.Err = ActionSkip, err.Error(), err
 			out.Skipped++
 		} else if created, err := ch.Write(out.DryRun); err != nil {
-			e.Action, e.Reason = ActionFail, err.Error()
+			e.Action, e.Reason, e.Err = ActionFail, err.Error(), err
 			out.Failed++
 		} else {
 			e.Action = ActionUpdate
@@ -194,6 +195,51 @@ func (out *ChangeResult) run(
 		out.Entries = append(out.Entries, e)
 		if progress != nil {
 			progress(e)
+		}
+	}
+	return nil
+}
+
+// Totals sums the outcomes of a command over its cameras.
+type Totals struct {
+	Written   int
+	Created   int
+	Skipped   int
+	Unchanged int // photos that needed no change, counted in Skipped
+	Failed    int
+}
+
+// runCameras plans and writes a change for every photo of every camera,
+// adding the outcomes to t and handing each camera's result to done before
+// moving on. It stops with ctx.Err() when the context is cancelled, after
+// done saw the partial result of the camera under way.
+func (t *Totals) runCameras(
+	ctx context.Context,
+	cameras []*camsync.ClockEstimate,
+	dryRun bool,
+	plan func(e *camsync.ClockEstimate, p *camsync.Photo) (*camsync.Change, error),
+	progress func(camera string, e Entry),
+	done func(e *camsync.ClockEstimate, cam ChangeResult),
+) error {
+	for _, est := range cameras {
+		cam := ChangeResult{Camera: est.Group.Camera, DryRun: dryRun}
+		var report func(Entry)
+		if progress != nil {
+			report = func(e Entry) { progress(cam.Camera, e) }
+		}
+		err := cam.run(ctx, est.Group.Photos, func(p *camsync.Photo) (*camsync.Change, error) { return plan(est, p) }, report)
+		for _, e := range cam.Entries {
+			if errors.Is(e.Err, camsync.ErrUnchanged) {
+				t.Unchanged++
+			}
+		}
+		t.Written += cam.Written
+		t.Created += cam.Created
+		t.Skipped += cam.Skipped
+		t.Failed += cam.Failed
+		done(est, cam)
+		if err != nil {
+			return err
 		}
 	}
 	return nil

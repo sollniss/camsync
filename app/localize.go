@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"time"
 
@@ -47,16 +46,13 @@ type LocalizedCamera struct {
 	DayChanges int      // photos whose date changes
 }
 
-// LocalizeResult is the outcome of a LocalizeCommand.
+// LocalizeResult is the outcome of a LocalizeCommand. Unchanged counts the
+// photos already in local time.
 type LocalizeResult struct {
-	Cameras   []LocalizedCamera
-	DryRun    bool
-	Evidence  int // photos that tell the local zone
-	Written   int
-	Created   int
-	Skipped   int
-	Unchanged int // photos already in local time, counted in Skipped
-	Failed    int
+	Totals
+	Cameras  []LocalizedCamera
+	DryRun   bool
+	Evidence int // photos that tell the local zone
 }
 
 // LocalizeHandler executes LocalizeCommand. Progress, if set, is called
@@ -74,7 +70,7 @@ func (h LocalizeHandler) Handle(ctx context.Context, cmd LocalizeCommand) (*Loca
 	if err := cmd.Validate(); err != nil {
 		return nil, err
 	}
-	clocks, selected, err := estimate(ctx, cmd.Scope, cmd.ClockSettings, cmd.Camera)
+	clocks, cameras, err := estimate(ctx, cmd.Scope, cmd.ClockSettings, cmd.Camera)
 	if err != nil {
 		return nil, err
 	}
@@ -83,69 +79,27 @@ func (h LocalizeHandler) Handle(ctx context.Context, cmd LocalizeCommand) (*Loca
 		z, _ := camsync.ParseZoneOffset(cmd.Zone) // validated
 		lopts.Zone = &z
 	}
-
 	out := &LocalizeResult{DryRun: cmd.DryRun, Evidence: clocks.Timeline.Len()}
-	for _, g := range selected {
-		est := clocks.Estimate(g)
-		cam := LocalizedCamera{ChangeResult: ChangeResult{Camera: g.Camera, DryRun: cmd.DryRun}, ClockZone: est.ClockZone}
-		var progress func(Entry)
-		if h.Progress != nil {
-			progress = func(e Entry) { h.Progress(g.Camera, e) }
-		}
-		plan := func(p *camsync.Photo) (*camsync.Change, error) {
-			ch, err := clocks.PlanLocalize(est, p, lopts)
-			if errors.Is(err, camsync.ErrUnchanged) {
-				out.Unchanged++
+	err = out.runCameras(ctx, cameras, cmd.DryRun,
+		func(e *camsync.ClockEstimate, p *camsync.Photo) (*camsync.Change, error) {
+			return clocks.PlanLocalize(e, p, lopts)
+		},
+		h.Progress,
+		func(e *camsync.ClockEstimate, res ChangeResult) {
+			cam := LocalizedCamera{ChangeResult: res, ClockZone: e.ClockZone}
+			for _, entry := range res.Entries {
+				if entry.After == nil {
+					continue
+				}
+				if entry.Before != nil && entry.Before.T.Format(time.DateOnly) != entry.After.T.Format(time.DateOnly) {
+					cam.DayChanges++
+				}
+				if !slices.Contains(cam.LocalZones, entry.After.TZ) {
+					cam.LocalZones = append(cam.LocalZones, entry.After.TZ)
+				}
 			}
-			return ch, err
-		}
-		err := cam.run(ctx, g.Photos, plan, progress)
-		for _, e := range cam.Entries {
-			if e.After == nil {
-				continue
-			}
-			if e.Before != nil && e.Before.T.Format(time.DateOnly) != e.After.T.Format(time.DateOnly) {
-				cam.DayChanges++
-			}
-			if !slices.Contains(cam.LocalZones, e.After.TZ) {
-				cam.LocalZones = append(cam.LocalZones, e.After.TZ)
-			}
-		}
-		slices.Sort(cam.LocalZones)
-		out.Cameras = append(out.Cameras, cam)
-		out.Written += cam.Written
-		out.Created += cam.Created
-		out.Skipped += cam.Skipped
-		out.Failed += cam.Failed
-		if err != nil {
-			return out, err
-		}
-	}
-	return out, nil
-}
-
-// estimate scans the scope, estimates every camera's clock and returns the
-// groups selected by camera, all of them when it is empty.
-func estimate(ctx context.Context, scope Scope, settings ClockSettings, camera string) (*camsync.Clocks, []*camsync.Group, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	res, err := scope.scan(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	groups := camsync.GroupPhotos(res.Photos)
-	opts, err := settings.options(groups)
-	if err != nil {
-		return nil, nil, err
-	}
-	selected := groups
-	if camera != "" {
-		g, err := camsync.SelectGroup(groups, camera)
-		if err != nil {
-			return nil, nil, invalid(err)
-		}
-		selected = []*camsync.Group{g}
-	}
-	return camsync.EstimateClocks(groups, opts), selected, nil
+			slices.Sort(cam.LocalZones)
+			out.Cameras = append(out.Cameras, cam)
+		})
+	return out, err
 }

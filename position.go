@@ -4,6 +4,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Position is a location in decimal degrees (WGS 84), south and west
@@ -82,10 +83,10 @@ func parseXMPCoordinate(v string, pos, neg byte, limit float64) (float64, bool) 
 		return 0, false
 	}
 	sign := 1.0
-	switch strings.ToUpper(v[len(v)-1:])[0] {
-	case pos:
+	switch unicode.ToUpper(rune(v[len(v)-1])) {
+	case rune(pos):
 		v = v[:len(v)-1]
-	case neg:
+	case rune(neg):
 		v, sign = v[:len(v)-1], -1
 	}
 	parts := strings.Split(v, ",")

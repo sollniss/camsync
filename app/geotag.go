@@ -47,17 +47,14 @@ type GeotaggedCamera struct {
 	MaxGap       time.Duration // largest reach of the positions written
 }
 
-// GeotagResult is the outcome of a GeotagCommand.
+// GeotagResult is the outcome of a GeotagCommand. Unchanged counts the
+// photos whose estimate is already written.
 type GeotagResult struct {
-	Cameras   []GeotaggedCamera
-	DryRun    bool
-	Evidence  int // located photos the positions come from
-	Written   int
-	Created   int
-	Skipped   int
-	Unchanged int // photos whose estimate is already written, counted in Skipped
-	Located   int // photos with a measured position, counted in Skipped
-	Failed    int
+	Totals
+	Cameras  []GeotaggedCamera
+	DryRun   bool
+	Evidence int // located photos the positions come from
+	Located  int // photos with a measured position, counted in Skipped
 }
 
 // GeotagHandler executes GeotagCommand. Progress, if set, is called after
@@ -73,53 +70,38 @@ func (h GeotagHandler) Handle(ctx context.Context, cmd GeotagCommand) (*GeotagRe
 	if err := cmd.Validate(); err != nil {
 		return nil, err
 	}
-	clocks, selected, err := estimate(ctx, cmd.Scope, cmd.ClockSettings, cmd.Camera)
+	clocks, cameras, err := estimate(ctx, cmd.Scope, cmd.ClockSettings, cmd.Camera)
 	if err != nil {
 		return nil, err
 	}
 	track := clocks.Track()
 	out := &GeotagResult{DryRun: cmd.DryRun, Evidence: track.Len()}
-	for _, g := range selected {
-		est := clocks.Estimate(g)
-		cam := GeotaggedCamera{ChangeResult: ChangeResult{Camera: g.Camera, DryRun: cmd.DryRun}, ClockZone: est.ClockZone}
-		var progress func(Entry)
-		if h.Progress != nil {
-			progress = func(e Entry) { h.Progress(g.Camera, e) }
-		}
-		plan := func(p *camsync.Photo) (*camsync.Change, error) {
-			ch, err := clocks.PlanGeotag(est, p, track, cmd.Track)
-			switch {
-			case errors.Is(err, camsync.ErrUnchanged):
-				out.Unchanged++
-			case errors.Is(err, camsync.ErrHasPosition):
-				cam.Located++
+	err = out.runCameras(ctx, cameras, cmd.DryRun,
+		func(e *camsync.ClockEstimate, p *camsync.Photo) (*camsync.Change, error) {
+			return clocks.PlanGeotag(e, p, track, cmd.Track)
+		},
+		h.Progress,
+		func(e *camsync.ClockEstimate, res ChangeResult) {
+			cam := GeotaggedCamera{ChangeResult: res, ClockZone: e.ClockZone}
+			var gaps []time.Duration
+			for _, entry := range res.Entries {
+				if errors.Is(entry.Err, camsync.ErrHasPosition) {
+					cam.Located++
+				}
+				if entry.Fix == nil {
+					continue
+				}
+				gaps = append(gaps, entry.Fix.Gap)
+				if entry.Fix.Interpolated {
+					cam.Interpolated++
+				}
 			}
-			return ch, err
-		}
-		err := cam.run(ctx, g.Photos, plan, progress)
-		var gaps []time.Duration
-		for _, e := range cam.Entries {
-			if e.Fix == nil {
-				continue
+			if len(gaps) > 0 {
+				slices.Sort(gaps)
+				cam.MedianGap, cam.MaxGap = gaps[len(gaps)/2], gaps[len(gaps)-1]
 			}
-			gaps = append(gaps, e.Fix.Gap)
-			if e.Fix.Interpolated {
-				cam.Interpolated++
-			}
-		}
-		if len(gaps) > 0 {
-			slices.Sort(gaps)
-			cam.MedianGap, cam.MaxGap = gaps[len(gaps)/2], gaps[len(gaps)-1]
-		}
-		out.Cameras = append(out.Cameras, cam)
-		out.Written += cam.Written
-		out.Created += cam.Created
-		out.Skipped += cam.Skipped
-		out.Located += cam.Located
-		out.Failed += cam.Failed
-		if err != nil {
-			return out, err
-		}
-	}
-	return out, nil
+			out.Located += cam.Located
+			out.Cameras = append(out.Cameras, cam)
+		})
+	return out, err
 }

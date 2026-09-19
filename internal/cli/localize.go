@@ -23,7 +23,7 @@ of the camera's zone or the browser's.
 
 The local zone comes from phones, which follow it wherever they are: the zone
 their photos record, or the one implied by their GPS time. For every photo
-the phone photo closest in time decides, within --max-gap (default 24h), so
+the phone photo closest in time decides, within --zone-gap (default 24h), so
 trips across zones and daylight saving changes come out right. Where no phone
 photo is near, --zone sets the local zone; otherwise the photo is skipped.
 
@@ -69,7 +69,7 @@ shift.`,
 			return nil
 		}),
 	}
-	clock.register(cmd, true)
+	clock.register(cmd)
 	f := cmd.Flags()
 	f.StringVarP(&camera, "camera", "c", "", `only localize this camera, as printed by "list" (all cameras still provide evidence)`)
 	f.StringVar(&zone, "zone", "", "local zone where no phone photo tells it, e.g. +02:00")

@@ -11,45 +11,51 @@ import (
 	"github.com/sollniss/camsync/app"
 )
 
-// clockFlags are the flags of the clock estimation, shared by suggest and
-// localize.
+// clockFlags are the flags of the clock estimation, shared by suggest,
+// localize and geotag.
 type clockFlags struct {
 	references, clockZones []string
-	maxOffset, maxZoneGap  string
+	maxOffset, zoneGap     string
 }
 
-func (c *clockFlags) register(cmd *cobra.Command, zoneGap bool) {
+func (c *clockFlags) register(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.StringArrayVar(&c.references, "reference", nil, `trusted camera as printed by "list"; repeat for several (default: phones and cameras that agree with GPS)`)
 	f.StringArrayVar(&c.clockZones, "clock-zone", nil, `zone a camera's clock runs on, as CAMERA=ZONE, e.g. "sony=Z" or "canon=+09:00"; repeat for several`)
 	f.StringVar(&c.maxOffset, "max-offset", "", "largest clock error to search for, e.g. 30m or 14h (default 12h)")
-	completions := map[string]cobra.CompletionFunc{"reference": completeCamera, "clock-zone": completeClockZone, "max-offset": noFileComp}
-	if zoneGap {
-		f.StringVar(&c.maxZoneGap, "max-gap", "", "how far in time a phone photo tells the local zone (default 24h)")
-		completions["max-gap"] = noFileComp
-	}
-	registerCompletions(cmd, completions)
+	f.StringVar(&c.zoneGap, "zone-gap", "", "how far in time a phone photo tells the local zone (default 24h)")
+	registerCompletions(cmd, map[string]cobra.CompletionFunc{"reference": completeCamera, "clock-zone": completeClockZone, "max-offset": noFileComp, "zone-gap": noFileComp})
 }
 
 func (c *clockFlags) settings() (app.ClockSettings, error) {
 	s := app.ClockSettings{References: c.references, ClockZones: c.clockZones}
-	for _, d := range []struct {
-		flag, value string
-		dst         *time.Duration
-	}{{"--max-offset", c.maxOffset, &s.MaxOffset}, {"--max-gap", c.maxZoneGap, &s.MaxZoneGap}} {
+	err := parseDurations(durationFlag{"--max-offset", c.maxOffset, &s.MaxOffset}, durationFlag{"--zone-gap", c.zoneGap, &s.MaxZoneGap})
+	return s, err
+}
+
+// durationFlag is a duration flag that must be positive when given.
+type durationFlag struct {
+	name, value string
+	dst         *time.Duration
+}
+
+// parseDurations stores the values of the flags that were given. A bad value
+// is a usage error naming the flag.
+func parseDurations(flags ...durationFlag) error {
+	for _, d := range flags {
 		if d.value == "" {
 			continue
 		}
 		v, err := camsync.ParseShift(d.value)
 		if err != nil {
-			return s, usage(err)
+			return usage(err)
 		}
 		if v <= 0 {
-			return s, usage(errors.New(d.flag + " must be positive"))
+			return usage(errors.New(d.name + " must be positive"))
 		}
 		*d.dst = v
 	}
-	return s, nil
+	return nil
 }
 
 // completeClockZone offers the camera names followed by "=".
@@ -118,7 +124,7 @@ previous or next day's activity easily looks like a match.`,
 			return printSuggest(out, res, shiftFlags(q.Scope))
 		}),
 	}
-	clock.register(cmd, false)
+	clock.register(cmd)
 	return cmd
 }
 

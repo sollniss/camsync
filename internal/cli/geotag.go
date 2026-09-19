@@ -1,12 +1,9 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -52,21 +49,8 @@ Use --dry-run first. The table shows how far in time the estimates reach;
 				return err
 			}
 			c := app.GeotagCommand{Scope: rt.scope(args), ClockSettings: settings, Camera: camera, DryRun: dryRun}
-			for _, d := range []struct {
-				flag, value string
-				dst         *time.Duration
-			}{{"--max-gap", maxGap, &c.Track.MaxGap}, {"--max-bridge", maxBridge, &c.Track.MaxBridge}} {
-				if d.value == "" {
-					continue
-				}
-				v, err := camsync.ParseShift(d.value)
-				if err != nil {
-					return usage(err)
-				}
-				if v <= 0 {
-					return usage(errors.New(d.flag + " must be positive"))
-				}
-				*d.dst = v
+			if err := parseDurations(durationFlag{"--max-gap", maxGap, &c.Track.MaxGap}, durationFlag{"--max-bridge", maxBridge, &c.Track.MaxBridge}); err != nil {
+				return err
 			}
 			out := cmd.OutOrStdout()
 			h := app.GeotagHandler{}
@@ -91,7 +75,7 @@ Use --dry-run first. The table shows how far in time the estimates reach;
 			return nil
 		}),
 	}
-	clock.register(cmd, false)
+	clock.register(cmd)
 	f := cmd.Flags()
 	f.StringVarP(&camera, "camera", "c", "", `only geotag this camera, as printed by "list" (all cameras still provide evidence)`)
 	f.StringVar(&maxGap, "max-gap", "", "how far in time a located photo reaches on its own (default 5m)")
@@ -136,7 +120,7 @@ func geotagView(res *app.GeotagResult) geotagJSON {
 	for _, c := range res.Cameras {
 		cv := geotaggedCameraView{
 			Camera: c.Camera, ClockZone: clockZoneJSON(c.ClockZone), Located: c.Located, Interpolated: c.Interpolated,
-			MedianGap: gapText(c.MedianGap), MaxGap: gapText(c.MaxGap),
+			MedianGap: camsync.FormatSpan(c.MedianGap), MaxGap: camsync.FormatSpan(c.MaxGap),
 			Written: c.Written, Created: c.Created, Skipped: c.Skipped, Failed: c.Failed, Entries: []entryView{},
 		}
 		for _, e := range c.Entries {
@@ -158,7 +142,7 @@ func printGeotag(w io.Writer, res *app.GeotagResult, verbose bool) error {
 	for _, c := range res.Cameras {
 		median, maxGap := "-", "-"
 		if c.Written > 0 {
-			median, maxGap = gapText(c.MedianGap), gapText(c.MaxGap)
+			median, maxGap = camsync.FormatSpan(c.MedianGap), camsync.FormatSpan(c.MaxGap)
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", c.Camera, len(c.Entries), c.Located, c.Written, c.Interpolated, c.Skipped, median, maxGap)
 	}
@@ -177,12 +161,4 @@ func printGeotag(w io.Writer, res *app.GeotagResult, verbose bool) error {
 	_, err := fmt.Fprintf(w, "\n%s%d sidecars written (%d new), %d skipped (%d located, %d already geotagged), %d failed; positions from %d located photos\n",
 		prefix, res.Written, res.Created, res.Skipped, res.Located, res.Unchanged, res.Failed, res.Evidence)
 	return err
-}
-
-// gapText renders a duration without sign, "0s" for zero.
-func gapText(d time.Duration) string {
-	if d == 0 {
-		return "0s"
-	}
-	return strings.TrimPrefix(camsync.FormatDuration(d.Abs()), "+")
 }

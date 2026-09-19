@@ -33,11 +33,7 @@ func (c *Clocks) PlanGeotag(e *ClockEstimate, p *Photo, track *Track, opts Track
 	fix, ok := track.At(instant, opts)
 	if !ok {
 		o := opts.withDefaults()
-		reach := o.MaxGap
-		if o.MaxBridge > reach {
-			reach = o.MaxBridge
-		}
-		return nil, errors.New("no located photo within " + gapText(reach))
+		return nil, errors.New("no located photo within " + FormatSpan(max(o.MaxGap, o.MaxBridge)))
 	}
 	if p.Position != nil {
 		lat, lon := p.Position.XMP()
@@ -67,7 +63,7 @@ func (f Fix) String() string {
 		b.WriteString(photoName(f.From))
 	}
 	b.WriteString(", ")
-	b.WriteString(gapText(f.Gap))
+	b.WriteString(FormatSpan(f.Gap))
 	b.WriteByte(')')
 	return b.String()
 }

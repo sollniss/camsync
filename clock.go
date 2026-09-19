@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -221,6 +222,14 @@ type ClockEstimate struct {
 	Note       string // why nothing was found
 }
 
+// The notes EstimateClocks gives when it cannot estimate a clock. The
+// remaining note, "no reference photos within ...", carries the search range.
+const (
+	NoteNoTimestamps         = "no timestamps"
+	NoteNoReference          = "no reference camera"
+	NoteReferenceZoneUnknown = "reference photos have no time zone" // set a clock zone for them
+)
+
 // Clocks is the result of EstimateClocks: a verdict per camera and the
 // evidence of the local zone.
 type Clocks struct {
@@ -229,8 +238,9 @@ type Clocks struct {
 	// WallClocks is set when no photo carries any zone information, so
 	// timestamps could only be compared as wall clocks.
 	WallClocks bool
-
-	maxZoneGap time.Duration
+	// MaxOffset and MaxZoneGap are the settings used, defaults filled in.
+	MaxOffset  time.Duration
+	MaxZoneGap time.Duration
 }
 
 // Estimate returns the estimate for g, or nil.
@@ -263,7 +273,7 @@ func (c *Clocks) Instant(e *ClockEstimate, p *Photo) (time.Time, bool) {
 	case "":
 		return time.Time{}, false
 	case ZoneLocal:
-		o, ok := c.Timeline.ZoneAtWall(t, c.maxZoneGap)
+		o, ok := c.Timeline.ZoneAtWall(t, c.MaxZoneGap)
 		return t.Add(-o.Zone), ok
 	}
 	return t.Add(-e.ClockZone.Zone), true
@@ -299,13 +309,12 @@ func (c *Clocks) instants(e *ClockEstimate) []time.Time {
 // zone is taken to follow the local zone. When no photo carries any zone
 // information at all, wall clocks are compared (see Clocks.WallClocks).
 func EstimateClocks(groups []*Group, opts ClockOptions) *Clocks {
-	maxOffset := opts.MaxOffset
-	if maxOffset <= 0 {
-		maxOffset = DefaultMaxOffset
+	c := &Clocks{Cameras: make([]ClockEstimate, len(groups)), WallClocks: len(opts.ClockZones) == 0, MaxOffset: opts.MaxOffset, MaxZoneGap: opts.MaxZoneGap}
+	if c.MaxOffset <= 0 {
+		c.MaxOffset = DefaultMaxOffset
 	}
-	c := &Clocks{Cameras: make([]ClockEstimate, len(groups)), WallClocks: len(opts.ClockZones) == 0, maxZoneGap: opts.MaxZoneGap}
-	if c.maxZoneGap <= 0 {
-		c.maxZoneGap = DefaultMaxZoneGap
+	if c.MaxZoneGap <= 0 {
+		c.MaxZoneGap = DefaultMaxZoneGap
 	}
 	var phones []*Photo
 	for i, g := range groups {
@@ -361,54 +370,65 @@ func EstimateClocks(groups []*Group, opts ClockOptions) *Clocks {
 		ref = append(ref, c.instants(e)...)
 	}
 
+	// The cameras are independent of each other from here on: each judgement
+	// reads the references and the timeline and writes its own estimate, so
+	// the alignment searches, the expensive part, run side by side.
+	hasReference := len(ref) > 0 || slices.ContainsFunc(c.Cameras, func(r ClockEstimate) bool { return r.Reference })
+	var wg sync.WaitGroup
 	for i := range c.Cameras {
-		e := &c.Cameras[i]
-		if e.Reference {
-			continue
-		}
-		dated := slices.ContainsFunc(e.Group.Photos, func(p *Photo) bool { return p.Original != nil })
-		switch {
-		case !dated:
-			e.Note = "no timestamps"
-		case e.GPS != nil && !e.GPS.ZoneInferred:
-			// Measured directly; better than any alignment.
-			e.Found, e.Basis, e.Offset, e.Matched = true, BasisGPS, -e.GPS.Error.Round(time.Second), e.GPS.Photos
-			e.Confidence = ConfidenceMedium
-			if e.GPS.Photos >= 3 {
-				e.Confidence = ConfidenceHigh
-			}
-		case len(ref) == 0 && slices.ContainsFunc(c.Cameras, func(r ClockEstimate) bool { return r.Reference }):
-			e.Note = "reference photos have no time zone; set one with --clock-zone"
-		case len(ref) == 0:
-			e.Note = "no reference camera"
-		case e.ClockZone.Known() || c.WallClocks:
-			a, ok := Align(ref, c.instants(e), maxOffset)
-			if !ok {
-				e.Note = "no reference photos within " + strings.TrimPrefix(FormatDuration(maxOffset), "+")
-				break
-			}
-			e.Found, e.Basis, e.Offset, e.Matched, e.Confidence = true, BasisActivity, a.Offset, a.Matched, a.Confidence
-		default:
-			// Read the wall clock as UTC: the offset found is the clock
-			// zone, negated, plus the clock error.
-			var walls []time.Time
-			for _, p := range e.Group.Photos {
-				if p.Original != nil {
-					walls = append(walls, p.Original.T)
-				}
-			}
-			search := max(maxOffset, 14*time.Hour)
-			a, ok := Align(ref, walls, search)
-			if !ok {
-				e.Note = "no reference photos within " + strings.TrimPrefix(FormatDuration(search), "+")
-				break
-			}
-			z := nearestZone(-a.Offset, c.Timeline.Zones())
-			e.ClockZone = ClockZone{z, ZoneFromActivity}
-			e.Found, e.Basis, e.Offset, e.Matched, e.Confidence = true, BasisActivity, a.Offset+z, a.Matched, a.Confidence
+		if e := &c.Cameras[i]; !e.Reference {
+			wg.Go(func() { c.judge(e, ref, hasReference) })
 		}
 	}
+	wg.Wait()
 	return c
+}
+
+// judge estimates the clock of the camera e against the reference instants;
+// hasReference says whether any camera is a reference, even one whose
+// photos gave no instants.
+func (c *Clocks) judge(e *ClockEstimate, ref []time.Time, hasReference bool) {
+	dated := slices.ContainsFunc(e.Group.Photos, func(p *Photo) bool { return p.Original != nil })
+	switch {
+	case !dated:
+		e.Note = NoteNoTimestamps
+	case e.GPS != nil && !e.GPS.ZoneInferred:
+		// Measured directly; better than any alignment.
+		e.Found, e.Basis, e.Offset, e.Matched = true, BasisGPS, -e.GPS.Error.Round(time.Second), e.GPS.Photos
+		e.Confidence = ConfidenceMedium
+		if e.GPS.Photos >= 3 {
+			e.Confidence = ConfidenceHigh
+		}
+	case len(ref) == 0 && hasReference:
+		e.Note = NoteReferenceZoneUnknown
+	case len(ref) == 0:
+		e.Note = NoteNoReference
+	case e.ClockZone.Known() || c.WallClocks:
+		a, ok := Align(ref, c.instants(e), c.MaxOffset)
+		if !ok {
+			e.Note = "no reference photos within " + FormatSpan(c.MaxOffset)
+			break
+		}
+		e.Found, e.Basis, e.Offset, e.Matched, e.Confidence = true, BasisActivity, a.Offset, a.Matched, a.Confidence
+	default:
+		// Read the wall clock as UTC: the offset found is the clock
+		// zone, negated, plus the clock error.
+		var walls []time.Time
+		for _, p := range e.Group.Photos {
+			if p.Original != nil {
+				walls = append(walls, p.Original.T)
+			}
+		}
+		search := max(c.MaxOffset, 14*time.Hour)
+		a, ok := Align(ref, walls, search)
+		if !ok {
+			e.Note = "no reference photos within " + FormatSpan(search)
+			break
+		}
+		z := nearestZone(-a.Offset, c.Timeline.Zones())
+		e.ClockZone = ClockZone{z, ZoneFromActivity}
+		e.Found, e.Basis, e.Offset, e.Matched, e.Confidence = true, BasisActivity, a.Offset+z, a.Matched, a.Confidence
+	}
 }
 
 // nearestZone returns the whole hour or one of the known zones nearest to d.

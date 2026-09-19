@@ -507,7 +507,7 @@ func TestLocalizeFlow(t *testing.T) {
 		{[]string{"localize", "--zone", "CEST", dir}, "invalid UTC offset"},
 		{[]string{"localize", "--clock-zone", "sony", dir}, "must have the form CAMERA=ZONE"},
 		{[]string{"localize", "--clock-zone", "nikon=Z", dir}, "no camera matches"},
-		{[]string{"localize", "--max-gap", "0", dir}, "--max-gap must be positive"},
+		{[]string{"localize", "--zone-gap", "0", dir}, "--zone-gap must be positive"},
 	} {
 		if code, _, errOut := run(t, c.args...); code != ExitUsage || !strings.Contains(errOut, c.want) {
 			t.Errorf("%v: code %d, stderr %q", c.args, code, errOut)
