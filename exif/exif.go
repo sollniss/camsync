@@ -21,6 +21,7 @@ import (
 const (
 	TagMake                = 0x010F
 	TagModel               = 0x0110
+	TagOrientation         = 0x0112 // stored as its number, "1" to "8"
 	TagDateTime            = 0x0132
 	TagExifIFD             = 0x8769
 	TagDateTimeOriginal    = 0x9003
@@ -457,6 +458,12 @@ func (t *tiffReader) readIFD(off int64, tags Tags) (exifIFD int64, err error) {
 		}
 		if tag == TagGPSIFD {
 			t.gpsIFD = int64(t.bo.Uint32(val))
+			continue
+		}
+		if tag == TagOrientation && typ == 3 && count == 1 {
+			if o := t.bo.Uint16(val[:2]); o >= 1 && o <= 8 {
+				tags[tag] = strconv.Itoa(int(o))
+			}
 			continue
 		}
 		if tag == tagMakerNote && count > 4 {

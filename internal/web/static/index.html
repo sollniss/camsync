@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>camsync organize</title>
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1>camsync organize</h1>
+    <span id="root" class="mono"></span>
+    <span id="stats"></span>
+  </div>
+  <form id="options" class="controls" autocomplete="off">
+    <label title="Pause in shooting that separates two events">gap <input name="gap" size="5"></label>
+    <label title="Distance between consecutive located photos that separates two events">jump <input name="jump" size="5"></label>
+    <label title="How far from home still counts as home">home radius <input name="homeRadius" size="5"></label>
+    <label title="How long an event away from home must last to be a trip">min trip <input name="minTrip" size="4"></label>
+    <label title="How many photos an event without a location needs to be a trip">min photos <input name="minTripPhotos" size="3"></label>
+    <label title="Where new trip folders come from">layout
+      <select name="layout">
+        <option value="auto">auto</option>
+        <option value="trips">trips</option>
+        <option value="periods">periods</option>
+      </select>
+    </label>
+    <label title="Home as LAT,LON; empty to infer">home <input name="home" size="16" placeholder="inferred"></label>
+    <button type="submit">Replan</button>
+    <button type="button" id="rescan" title="Read the library from disk again">Rescan</button>
+  </form>
+</header>
+<main>
+  <aside id="folders-pane">
+    <h2>Folders <span id="folder-count" class="count"></span></h2>
+    <ul id="folders" class="list"></ul>
+  </aside>
+  <section id="center">
+    <div id="timeline-wrap">
+      <div class="legend">
+        <span class="swatch trip"></span>trip
+        <span class="swatch outing"></span>outing
+        <span class="swatch home"></span>home
+        <span class="hint">wheel zooms, drag pans, click selects, double click resets</span>
+      </div>
+      <svg id="timeline"></svg>
+    </div>
+    <div id="map"></div>
+    <div id="detail"><p class="muted">Select an event on the timeline or map, or a folder on the left.</p></div>
+  </section>
+  <aside id="suggestions-pane">
+    <h2>Suggestions <span id="suggestion-count" class="count"></span></h2>
+    <div class="toolbar">
+      <button type="button" id="accept-high" title="Accept every suggestion with high confidence">Accept high</button>
+      <button type="button" id="accept-all">Accept all</button>
+      <button type="button" id="accept-none">Clear</button>
+      <label><input type="checkbox" id="only-related"> only for selection</label>
+    </div>
+    <div id="suggestions" class="cards"></div>
+    <h2>Notes</h2>
+    <ul id="notes" class="notes"></ul>
+    <div class="apply-bar">
+      <button type="button" id="download-plan" title="Save the accepted moves as a plan file for camsync organize --apply">Save plan</button>
+      <button type="button" id="apply" class="primary" disabled>Apply 0 moves</button>
+    </div>
+  </aside>
+</main>
+
+<dialog id="photo-dialog">
+  <div class="dialog-body">
+    <img id="photo-big" alt="">
+    <dl id="photo-meta"></dl>
+  </div>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
+
+<dialog id="apply-dialog">
+  <h2 id="apply-title">Apply</h2>
+  <div id="apply-body"></div>
+  <form method="dialog" class="dialog-actions">
+    <button id="apply-cancel" value="cancel">Cancel</button>
+    <button id="apply-confirm" value="confirm" class="primary">Move files</button>
+  </form>
+</dialog>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

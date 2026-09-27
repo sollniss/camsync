@@ -1,0 +1,419 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	goruntime "runtime"
+	"sort"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/spf13/cobra"
+
+	"github.com/sollniss/camsync"
+	"github.com/sollniss/camsync/app"
+	"github.com/sollniss/camsync/internal/web"
+	"github.com/sollniss/camsync/preview"
+)
+
+func (rt *runtime) organizeCommand() *cobra.Command {
+	var ui, open, dryRun, verbose bool
+	var listen, planFile, applyFile, gap, jump, home, homeRadius, minTrip, layout string
+	var minTripPhotos int
+	var inboxes []string
+	cmd := &cobra.Command{
+		Use:   "organize [DIR]",
+		Short: "Find the events in a photo library and suggest where photos belong",
+		Long: `Organize scans a whole library, groups the photos of all cameras into
+events by time and place, works out what each folder holds and suggests
+moves that tidy the library up. Nothing is moved unless a plan is applied.
+
+An event is a run of photos with no pause longer than --gap between them
+and no jump further than --jump between located photos. Photos are placed
+by their wall clock, so cameras whose clocks are hours apart still share
+an event, and an event that runs into the next day away from home is a
+trip. Home is where photos were taken on the most days; give it with
+--home when the guess is wrong.
+
+Folders are read as one of:
+  event    holds one event or a few close together, e.g. a trip
+  period   a calendar year or month by its name: 2024, 2024-05, 2024/05
+  inbox    where photos land before they are sorted: the root itself, a
+           folder named inbox, unsorted, import, DCIM and the like, or
+           any folder given with --inbox
+  mixed    many events, no recognisable scheme
+
+Suggestions are:
+  merge    an event folder holding the same event as another one, e.g. one
+           folder per camera for the same trip
+  move     photos into the folder that holds their event, or a stray back
+           to the inbox, or a photo out of a period it was not taken in
+  create   a trip found in the inbox that has no folder yet
+  stray    photos that do not belong where they are and have nowhere to go
+
+Confidence is high when the event is placed by positions on both sides,
+medium when one side is placed by time alone and low when the event has no
+positions at all. --layout trips also pulls trips out of period folders;
+--layout periods never creates trip folders.
+
+--ui opens the same picture in the browser with a timeline, a map and
+previews, where suggestions can be accepted one by one and applied.
+--plan writes every suggestion with a destination to a file to review by
+hand; --apply carries out such a file, or one saved from the browser.
+Moving files confuses catalog applications such as Lightroom, which
+reference files by path.`,
+		Example: `  camsync organize ~/Photos
+  camsync organize --ui ~/Photos
+  camsync organize --inbox Inbox --home 52.52,13.40 ~/Photos
+  camsync organize --plan plan.json ~/Photos && camsync organize --apply plan.json --dry-run
+  camsync organize --gap 12h --jump 20km --layout trips -o json ~/Photos`,
+		Args:              dirArgs,
+		ValidArgsFunction: completeDirs,
+		RunE: rt.runE(func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			if applyFile != "" {
+				return rt.applyPlan(cmd.Context(), out, applyFile, dryRun, verbose)
+			}
+			opts := camsync.LibraryOptions{Inboxes: inboxes}
+			if err := parseDurations(durationFlag{"--gap", gap, &opts.MaxGap}, durationFlag{"--min-trip", minTrip, &opts.MinTripSpan}); err != nil {
+				return err
+			}
+			if err := parseDistances(distanceFlag{"--jump", jump, &opts.MaxJump}, distanceFlag{"--home-radius", homeRadius, &opts.HomeRadius}); err != nil {
+				return err
+			}
+			if minTripPhotos < 0 {
+				return usage(errors.New("--min-trip-photos must not be negative"))
+			}
+			opts.MinTripPhotos = minTripPhotos
+			if home != "" {
+				p, err := camsync.ParsePosition(home)
+				if err != nil {
+					return usage(err)
+				}
+				opts.Home = &p
+			}
+			l, err := camsync.ParseLayout(layout)
+			if err != nil {
+				return usage(err)
+			}
+			opts.Layout = l
+			q := app.OrganizeQuery{Scope: rt.scope(args), Options: opts}
+			res, err := app.OrganizeHandler{}.Handle(cmd.Context(), q)
+			if err != nil {
+				return err
+			}
+			if ui {
+				return serveUI(cmd.Context(), cmd.ErrOrStderr(), q.Scope, res, listen, open)
+			}
+			if planFile != "" {
+				if err := writePlan(planFile, res); err != nil {
+					return err
+				}
+			}
+			if rt.json() {
+				return writeJSON(out, web.View(res))
+			}
+			return printOrganize(out, res, verbose, planFile)
+		}),
+	}
+	f := cmd.Flags()
+	f.BoolVar(&ui, "ui", false, "open the library in the browser instead of printing")
+	f.StringVar(&listen, "listen", "127.0.0.1:0", "address the --ui server listens on")
+	f.BoolVar(&open, "open", false, "with --ui, open the browser")
+	f.StringVar(&planFile, "plan", "", "write the suggestions as a plan file to apply later")
+	f.StringVar(&applyFile, "apply", "", "carry out the moves of a plan file instead of scanning")
+	f.BoolVarP(&dryRun, "dry-run", "n", false, "with --apply, report what would move without moving anything")
+	f.StringVar(&gap, "gap", "", "pause in shooting that separates two events (default 1d)")
+	f.StringVar(&jump, "jump", "", "distance between consecutive located photos that separates two events, e.g. 20km (default 50km)")
+	f.StringVar(&home, "home", "", "where the photos' owner lives, as LAT,LON (default: inferred)")
+	f.StringVar(&homeRadius, "home-radius", "", "how far from home a photo still counts as at home (default 30km)")
+	f.StringVar(&minTrip, "min-trip", "", "how long an event away from home must last to be a trip (default 18h)")
+	f.IntVar(&minTripPhotos, "min-trip-photos", 0, "how many photos an event without a location needs to be a trip (default 10)")
+	f.StringVar(&layout, "layout", "auto", `"auto", "trips" (pull trips out of period folders too) or "periods" (never create trip folders)`)
+	f.StringArrayVar(&inboxes, "inbox", nil, "folder where photos land before they are sorted, relative to DIR; repeat for several")
+	f.BoolVarP(&verbose, "verbose", "v", false, "also list every photo of every suggestion")
+	registerCompletions(cmd, map[string]cobra.CompletionFunc{
+		"layout": cobra.FixedCompletions([]cobra.Completion{
+			cobra.CompletionWithDesc("auto", "keep every folder's own scheme"),
+			cobra.CompletionWithDesc("trips", "give every trip its own folder"),
+			cobra.CompletionWithDesc("periods", "never create trip folders"),
+		}, cobra.ShellCompDirectiveNoFileComp),
+		"inbox": func(_ *cobra.Command, _ []string, _ string) ([]cobra.Completion, cobra.ShellCompDirective) {
+			return nil, cobra.ShellCompDirectiveFilterDirs
+		},
+		"gap": noFileComp, "jump": noFileComp, "home": noFileComp, "home-radius": noFileComp, "min-trip": noFileComp, "min-trip-photos": noFileComp, "listen": noFileComp,
+	})
+	for _, name := range []string{"plan", "apply"} {
+		if err := cmd.MarkFlagFilename(name, "json"); err != nil {
+			panic(err)
+		}
+	}
+	return cmd
+}
+
+// distanceFlag is a distance flag that must be positive when given.
+type distanceFlag struct {
+	name, value string
+	dst         *float64
+}
+
+func parseDistances(flags ...distanceFlag) error {
+	for _, d := range flags {
+		if d.value == "" {
+			continue
+		}
+		v, err := camsync.ParseDistance(d.value)
+		if err != nil {
+			return usage(err)
+		}
+		if v <= 0 {
+			return usage(errors.New(d.name + " must be positive"))
+		}
+		*d.dst = v
+	}
+	return nil
+}
+
+// serveUI runs the browser interface until the context is cancelled.
+func serveUI(ctx context.Context, msgs io.Writer, scope app.Scope, res *app.OrganizeResult, listen string, open bool) error {
+	var cache *preview.Cache
+	if dir, err := preview.DefaultCacheDir(); err == nil {
+		cache = preview.NewCache(dir, 0)
+	}
+	srv := web.New(scope, res, cache)
+	err := web.Serve(ctx, listen, srv, func(url string) {
+		fmt.Fprintf(msgs, "Serving %s at %s (Ctrl-C to stop)\n", scope.Dir, url)
+		if open {
+			if err := openBrowser(url); err != nil {
+				fmt.Fprintf(msgs, "could not open the browser: %v\n", err)
+			}
+		}
+	})
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+// openBrowser asks the desktop to open url.
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch goruntime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
+// writePlan writes every suggestion that has a destination.
+func writePlan(path string, res *app.OrganizeResult) error {
+	plan := camsync.Plan{Root: res.Root, Moves: []camsync.Move{}}
+	for _, s := range res.Suggestions {
+		plan.Moves = append(plan.Moves, s.Moves()...)
+	}
+	data, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+// applyPlan reads a plan file and carries it out.
+func (rt *runtime) applyPlan(ctx context.Context, out io.Writer, path string, dryRun, verbose bool) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var plan camsync.Plan
+	if err := json.Unmarshal(data, &plan); err != nil {
+		return usage(fmt.Errorf("%s: %w", path, err))
+	}
+	h := app.ApplyHandler{}
+	if verbose && !rt.json() {
+		h.Progress = func(r camsync.MoveResult) { printMove(out, r) }
+	}
+	res, err := h.Handle(ctx, app.ApplyCommand{Plan: plan, DryRun: dryRun})
+	if err != nil {
+		return err
+	}
+	if rt.json() {
+		if err := writeJSON(out, applyView(res)); err != nil {
+			return err
+		}
+	} else {
+		if !verbose {
+			for _, r := range res.Results {
+				if r.Err != nil {
+					printMove(out, r)
+				}
+			}
+		}
+		prefix := ""
+		if res.DryRun {
+			prefix = "dry run: "
+		}
+		fmt.Fprintf(out, "%s%d photos moved, %d failed", prefix, res.Moved, res.Failed)
+		if len(res.Created) > 0 {
+			fmt.Fprintf(out, ", %d folders created", len(res.Created))
+		}
+		fmt.Fprintln(out)
+	}
+	if res.Failed > 0 {
+		return fmt.Errorf("%d photos could not be moved", res.Failed)
+	}
+	return nil
+}
+
+func printMove(w io.Writer, r camsync.MoveResult) {
+	if r.Err != nil {
+		fmt.Fprintf(w, "FAILED  %s: %v\n", r.Path, r.Err)
+		return
+	}
+	fmt.Fprintf(w, "move    %s -> %s\n", r.Path, r.To)
+}
+
+type applyJSON struct {
+	DryRun  bool             `json:"dryRun"`
+	Moved   int              `json:"moved"`
+	Failed  int              `json:"failed"`
+	Created []string         `json:"created"`
+	Results []moveResultView `json:"results"`
+}
+
+type moveResultView struct {
+	Path    string `json:"path"`
+	Sidecar string `json:"sidecar,omitempty"`
+	To      string `json:"to"`
+	NewPath string `json:"newPath"`
+	Error   string `json:"error,omitempty"`
+}
+
+func applyView(res *camsync.ApplyResult) applyJSON {
+	v := applyJSON{DryRun: res.DryRun, Moved: res.Moved, Failed: res.Failed, Created: res.Created, Results: []moveResultView{}}
+	if v.Created == nil {
+		v.Created = []string{}
+	}
+	sort.Strings(v.Created)
+	for _, r := range res.Results {
+		mv := moveResultView{Path: r.Path, Sidecar: r.Sidecar, To: r.To, NewPath: r.NewPath}
+		if r.Err != nil {
+			mv.Error = r.Err.Error()
+		}
+		v.Results = append(v.Results, mv)
+	}
+	return v
+}
+
+// printOrganize renders the events, the folders, the suggestions and the
+// notes as tables.
+func printOrganize(w io.Writer, res *app.OrganizeResult, verbose bool, planFile string) error {
+	rel := func(path string) string {
+		r, err := filepath.Rel(res.Root, path)
+		if err != nil {
+			return path
+		}
+		if r == "." {
+			return "(root)"
+		}
+		return r
+	}
+	switch {
+	case res.Home == nil:
+		fmt.Fprintln(w, "HOME  unknown: no photo has a position, so events cannot be told from trips at home")
+	case res.HomeInferred:
+		fmt.Fprintf(w, "HOME  %s (inferred: photos on the most days; override with --home)\n", res.Home)
+	default:
+		fmt.Fprintf(w, "HOME  %s\n", res.Home)
+	}
+
+	fmt.Fprintln(w, "\nEVENTS")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "#\tDATES\tKIND\tPHOTOS\tLOCATED\tCAMERAS\tFOLDERS")
+	for _, e := range res.Events {
+		cameras := make([]string, 0, len(e.Cameras))
+		for c := range e.Cameras {
+			cameras = append(cameras, c)
+		}
+		sort.Strings(cameras)
+		var folders []string
+		for _, f := range res.Folders {
+			if n := f.Counts[e]; n > 0 {
+				folders = append(folders, fmt.Sprintf("%s (%d)", rel(f.Path), n))
+			}
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%d\t%s\t%s\n", e.Index, e.Name(), e.Kind, len(e.Photos), e.Located, strings.Join(cameras, ", "), strings.Join(folders, ", "))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(w, "\nFOLDERS")
+	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "FOLDER\tKIND\tPHOTOS\tEVENTS\tNOTE")
+	for _, f := range res.Folders {
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%s\n", rel(f.Path), f.Kind, len(f.Photos), len(f.Events), f.Note)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(w, "\nSUGGESTIONS")
+	if len(res.Suggestions) == 0 {
+		fmt.Fprintln(w, "nothing to tidy with these settings")
+	} else {
+		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tACTION\tPHOTOS\tCONFIDENCE\tFROM\tTO\tREASON")
+		moves := 0
+		for _, s := range res.Suggestions {
+			from, to := "several", "-"
+			if s.From != nil {
+				from = rel(s.From.Path)
+			}
+			if s.To != "" {
+				to = rel(s.To)
+				if res.Folder(s.To) == nil {
+					to += " (new)"
+				}
+				moves += len(s.Photos)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n", s.ID, s.Kind, len(s.Photos), s.Confidence, from, to, s.Reason)
+			if verbose {
+				for _, p := range s.Photos {
+					fmt.Fprintf(tw, "\t\t\t\t%s\t\t\n", rel(p.Path))
+				}
+			}
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "\n%d suggestions, %d photos to move.", len(res.Suggestions), moves)
+		if planFile != "" {
+			fmt.Fprintf(w, " Plan written to %s; review it, then run: camsync organize --apply %s --dry-run\n", planFile, planFile)
+		} else {
+			fmt.Fprintln(w, " Review them with --ui, or write them with --plan FILE and apply with --apply FILE.")
+		}
+	}
+
+	if len(res.Notes) > 0 {
+		fmt.Fprintln(w, "\nNOTES")
+		for _, n := range res.Notes {
+			fmt.Fprintf(w, "- %s\n", n.Text)
+			if verbose {
+				for _, p := range n.Photos {
+					fmt.Fprintf(w, "    %s\n", rel(p.Path))
+				}
+			}
+		}
+	}
+	return nil
+}

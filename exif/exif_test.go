@@ -227,3 +227,19 @@ func TestGPSPosition(t *testing.T) {
 		}
 	}
 }
+
+func TestOrientation(t *testing.T) {
+	for _, bo := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		entries := append([]testimg.Entry{testimg.Short(bo, exif.TagOrientation, 6)}, ifd0...)
+		tags, _, err := exif.ReadFile(writeTemp(t, "o.jpg", testimg.JPEG(testimg.BuildTIFF(bo, entries, nil))))
+		if err != nil || tags[exif.TagOrientation] != "6" {
+			t.Errorf("%v: orientation = %q, %v", bo, tags[exif.TagOrientation], err)
+		}
+	}
+	// Out-of-range values are dropped.
+	entries := append([]testimg.Entry{testimg.Short(binary.LittleEndian, exif.TagOrientation, 9)}, ifd0...)
+	tags, _, _ := exif.ReadFile(writeTemp(t, "o.jpg", testimg.JPEG(testimg.BuildTIFF(binary.LittleEndian, entries, nil))))
+	if _, ok := tags[exif.TagOrientation]; ok {
+		t.Error("orientation 9 kept")
+	}
+}

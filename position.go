@@ -140,3 +140,17 @@ func parseDecimalPosition(lat, lon string) (Position, bool) {
 	lo, err2 := strconv.ParseFloat(lon, 64)
 	return Position{la, lo}, lat != "" && lon != "" && err1 == nil && err2 == nil
 }
+
+// ParsePosition parses "lat, lon" or "lat lon" in decimal degrees, south
+// and west negative, as typed on a command line.
+func ParsePosition(v string) (Position, error) {
+	fields := strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ';' || unicode.IsSpace(r) })
+	if len(fields) != 2 {
+		return Position{}, fmt.Errorf("invalid position %q (use LAT,LON in decimal degrees)", v)
+	}
+	p, ok := parseDecimalPosition(fields[0], fields[1])
+	if !ok || math.IsNaN(p.Lat) || math.IsNaN(p.Lon) || math.Abs(p.Lat) > 90 || math.Abs(p.Lon) > 180 {
+		return Position{}, fmt.Errorf("invalid position %q (use LAT,LON in decimal degrees)", v)
+	}
+	return p, nil
+}

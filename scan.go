@@ -5,6 +5,11 @@
 // group them by camera, then PlanShift (or PlanReset) and Change.Write for
 // every photo of the chosen group. Timestamps are read from the sidecar when
 // it has them and from the image file otherwise, so shifts accumulate.
+//
+// Organize looks at a whole library instead: DetectEvents groups the photos
+// of all cameras into events by time and place, and Organize works out what
+// each folder holds and suggests moves, which ApplyPlan carries out. Those
+// are the only functions that move image files.
 package camsync
 
 import (
@@ -108,6 +113,9 @@ type Photo struct {
 	Camera string // display name derived from Make and Model
 	Make   string
 	Model  string
+	// Orientation is the EXIF orientation of the image, 1 to 8, or 0 when
+	// unknown. Previews are rotated accordingly.
+	Orientation int
 
 	// Values from the image file itself, which is never modified.
 	FileOriginal  *Stamp
@@ -152,13 +160,16 @@ func (p *Photo) Offset() (time.Duration, bool) {
 	return d, true
 }
 
+// UnknownCamera is the name of photos without Make and Model.
+const UnknownCamera = "Unknown camera"
+
 // CameraName builds the display name for a camera, avoiding the duplicated
 // vendor that models like "Canon EOS R5" would otherwise get.
 func CameraName(mk, model string) string {
 	mk, model = strings.TrimSpace(mk), strings.TrimSpace(model)
 	switch {
 	case mk == "" && model == "":
-		return "Unknown camera"
+		return UnknownCamera
 	case model == "":
 		return mk
 	case mk == "" || strings.HasPrefix(strings.ToLower(model), strings.ToLower(mk)):
@@ -217,6 +228,7 @@ func loadPhoto(path, target, sidecar string) *Photo {
 		p.Err = err
 	}
 	p.Make, p.Model = tags[exif.TagMake], tags[exif.TagModel]
+	p.Orientation, _ = strconv.Atoi(tags[exif.TagOrientation])
 	p.FileOriginal, p.FileDigitized = stampsFromExif(tags)
 	p.Original, p.Digitized = p.FileOriginal, p.FileDigitized
 	if gps, ok := ParseGPSTime(tags[exif.TagGPSDateStamp], tags[exif.TagGPSTimeStamp]); ok {
@@ -417,8 +429,8 @@ func GroupPhotos(photos []*Photo) []*Group {
 	}
 	sort.Slice(groups, func(i, j int) bool {
 		a, b := groups[i].Camera, groups[j].Camera
-		if (a == "Unknown camera") != (b == "Unknown camera") {
-			return b == "Unknown camera"
+		if (a == UnknownCamera) != (b == UnknownCamera) {
+			return b == UnknownCamera
 		}
 		return strings.ToLower(a) < strings.ToLower(b)
 	})
@@ -535,4 +547,11 @@ func SelectGroup(groups []*Group, query string) (*Group, error) {
 		return nil, fmt.Errorf("no camera matches %q; available: %s", query, strings.Join(names, " | "))
 	}
 	return nil, fmt.Errorf("camera %q is ambiguous: %s", query, strings.Join(matches, " | "))
+}
+
+// FindSidecar returns the existing sidecar of the image at path in either
+// naming style, or "" when there is none.
+func FindSidecar(path string) string {
+	_, candidates := SidecarPaths(path, SidecarByExt)
+	return findSidecar(candidates)
 }

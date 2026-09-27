@@ -59,7 +59,7 @@ func BuildTIFF(bo binary.ByteOrder, ifd0, exifIFD []Entry) []byte {
 			}
 			put(e.Tag)
 			put(e.Type)
-			put(uint32(len(e.Data)))
+			put(uint32(len(e.Data) / typeSize(e.Type)))
 			if len(e.Data) <= 4 {
 				v := make([]byte, 4)
 				copy(v, e.Data)
@@ -409,4 +409,24 @@ func gpsIFD(bo binary.ByteOrder, off int, date string, h, m int, sec float64, po
 	put(uint32(0)) // next IFD
 	b.Write(data.Bytes())
 	return b.Bytes()
+}
+
+// typeSize is the byte size of one element of a TIFF type.
+func typeSize(typ uint16) int {
+	switch typ {
+	case 3: // SHORT
+		return 2
+	case 4, 9: // LONG, SLONG
+		return 4
+	case 5, 10: // RATIONAL, SRATIONAL
+		return 8
+	}
+	return 1
+}
+
+// Short builds a single SHORT entry.
+func Short(bo binary.ByteOrder, tag uint16, v uint16) Entry {
+	b := make([]byte, 2)
+	bo.PutUint16(b, v)
+	return Entry{Tag: tag, Type: 3, Data: b}
 }

@@ -55,3 +55,16 @@ func TestPositionGeometry(t *testing.T) {
 		t.Errorf("quarter = %v", q)
 	}
 }
+
+func TestParsePosition(t *testing.T) {
+	for _, v := range []string{"52.52,13.40", "52.52, 13.40", "52.52 13.40", "-33.9;151.2"} {
+		if _, err := ParsePosition(v); err != nil {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+	for _, v := range []string{"", "52.52", "91,0", "0,181", "a,b", "1,2,3"} {
+		if _, err := ParsePosition(v); err == nil {
+			t.Errorf("%q accepted", v)
+		}
+	}
+}

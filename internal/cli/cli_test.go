@@ -623,3 +623,109 @@ func TestGeotagFlow(t *testing.T) {
 		}
 	}
 }
+
+func libraryDir(t *testing.T) string {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	root := t.TempDir()
+	write := func(rel, mk, model, dto string, pos *[2]float64) {
+		ifd0 := []testimg.Entry{testimg.ASCII(exif.TagMake, mk), testimg.ASCII(exif.TagModel, model)}
+		if pos != nil {
+			ifd0 = append(ifd0, testimg.GPSAt(binary.LittleEndian, "2024:05:02", 10, 0, 0, pos[0], pos[1]))
+		}
+		tiff := testimg.BuildTIFF(binary.LittleEndian, ifd0, []testimg.Entry{testimg.ASCII(exif.TagDateTimeOriginal, dto)})
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, path, testimg.JPEG(tiff))
+	}
+	away := &[2]float64{54.42, 13.43}
+	for d := 1; d <= 3; d++ {
+		for h := 9; h <= 12; h++ {
+			write("Trips/Rügen/c"+string(rune('0'+d))+string(rune('a'+h))+".jpg", "Canon", "EOS R5", fmt.Sprintf("2024:05:%02d %02d:00:00", d, h), nil)
+		}
+	}
+	write("Trips/Rügen/p1.jpg", "Apple", "iPhone 15", "2024:05:02 10:00:00", away)
+	write("Inbox/p2.jpg", "Apple", "iPhone 15", "2024:05:01 11:30:00", away)
+	write("Inbox/p3.jpg", "Apple", "iPhone 15", "2024:05:03 11:30:00", away)
+	mustWrite(t, filepath.Join(root, "Inbox", "p3.jpg.xmp"), []byte(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about=""/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`))
+	return root
+}
+
+func TestOrganizeReportPlanAndApply(t *testing.T) {
+	root := libraryDir(t)
+	code, out, errOut := run(t, "organize", root)
+	if code != 0 || errOut != "" {
+		t.Fatalf("code %d, stderr %q", code, errOut)
+	}
+	for _, want := range []string{"HOME  ", "EVENTS", "FOLDERS", "Inbox", "inbox", "Trips/Rügen", "event", "SUGGESTIONS", "s1  move    2       high", "1 suggestions, 2 photos to move"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report lacks %q:\n%s", want, out)
+		}
+	}
+	code, out, _ = run(t, "organize", "-v", "--home", "52.52,13.40", "--layout", "periods", root)
+	if code != 0 || !strings.Contains(out, "Inbox/p2.jpg") || strings.Contains(out, "inferred") {
+		t.Errorf("verbose: code %d\n%s", code, out)
+	}
+
+	code, out, _ = run(t, "organize", "-o", "json", root)
+	if code != 0 {
+		t.Fatal(out)
+	}
+	var v struct {
+		Root        string           `json:"root"`
+		Suggestions []map[string]any `json:"suggestions"`
+		Photos      []map[string]any `json:"photos"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil || v.Root != root || len(v.Suggestions) != 1 || len(v.Photos) != 15 {
+		t.Errorf("json: %v %+v", err, v)
+	}
+
+	// Bad values are usage errors.
+	for _, args := range [][]string{{"--gap", "x"}, {"--jump", "-1"}, {"--home", "far"}, {"--layout", "weekly"}, {"--min-trip-photos", "-2"}, {"--home-radius", "0"}} {
+		if code, _, _ := run(t, append([]string{"organize"}, append(args, root)...)...); code != ExitUsage {
+			t.Errorf("%v: code %d", args, code)
+		}
+	}
+
+	// Write a plan, dry-run it, apply it.
+	plan := filepath.Join(t.TempDir(), "plan.json")
+	code, out, _ = run(t, "organize", "--plan", plan, root)
+	if code != 0 || !strings.Contains(out, "Plan written to "+plan) {
+		t.Fatalf("plan: %d\n%s", code, out)
+	}
+	data, err := os.ReadFile(plan)
+	if err != nil || !strings.Contains(string(data), `"moves"`) || !strings.Contains(string(data), "p3.jpg.xmp") {
+		t.Fatalf("plan file: %v %s", err, data)
+	}
+	code, out, _ = run(t, "organize", "--apply", plan, "--dry-run", "-v", root)
+	if code != 0 || !strings.Contains(out, "dry run: 2 photos moved, 0 failed") || !strings.Contains(out, "move    ") {
+		t.Errorf("dry run: %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "Inbox", "p2.jpg")); err != nil {
+		t.Error("dry run moved a file")
+	}
+	code, out, _ = run(t, "organize", "--apply", plan, "-o", "json")
+	if code != 0 || !strings.Contains(out, `"moved": 2`) {
+		t.Errorf("apply: %d\n%s", code, out)
+	}
+	for _, name := range []string{"p2.jpg", "p3.jpg", "p3.jpg.xmp"} {
+		if _, err := os.Stat(filepath.Join(root, "Trips", "Rügen", name)); err != nil {
+			t.Error(err)
+		}
+	}
+	// Applying again fails: the files are gone from where the plan says.
+	code, out, errOut = run(t, "organize", "--apply", plan)
+	if code != ExitFailure || !strings.Contains(out, "FAILED") || !strings.Contains(errOut, "2 photos could not be moved") {
+		t.Errorf("again: %d\n%s\n%s", code, out, errOut)
+	}
+	// A plan that is not JSON is a usage error, a missing one a failure.
+	mustWrite(t, plan, []byte("nope"))
+	if code, _, _ := run(t, "organize", "--apply", plan); code != ExitUsage {
+		t.Errorf("bad plan: %d", code)
+	}
+	if code, _, _ := run(t, "organize", "--apply", filepath.Join(root, "missing.json")); code != ExitFailure {
+		t.Errorf("missing plan: %d", code)
+	}
+}

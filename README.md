@@ -24,6 +24,7 @@ camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-
 camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--zone-gap DURATION] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
 camsync geotag   [DIR] [--camera NAME] [--gpx FILE]... [--max-gap DURATION] [--max-bridge DURATION] [--max-distance METRES] [--dry-run] [-v]
 camsync reset    [DIR] --camera NAME [--dry-run]
+camsync organize [DIR] [--ui] [--gap DURATION] [--jump DISTANCE] [--home LAT,LON] [--inbox DIR]... [--layout auto|trips|periods] [--plan FILE] [--apply FILE] [--dry-run]
 ```
 
 1. See which cameras are in the directory:
@@ -57,6 +58,10 @@ camsync reset    [DIR] --camera NAME [--dry-run]
 5. Undo everything for a camera with `reset`, which writes the timestamps
    from the image files back into the sidecars and removes the locations
    `geotag` wrote.
+
+6. Tidy the whole library with `organize`, which finds the trips among all
+   folders and suggests merges and moves, on the command line or in the
+   browser with `--ui` (see [Organizing a library](#organizing-a-library)).
 
 Durations: `2m30s`, `-45s`, `1h`, `+1d2h`. A leading sign applies to the whole
 value. `--timezone +02:00` (or `--tz`) stamps a zone on the written dates (see Timezones). Add
@@ -217,6 +222,109 @@ own, from the image or from a sidecar written by another tool, are never
 touched, and estimates are never used to place other photos. Running
 `geotag` again updates estimates when the evidence changed, and `reset`
 removes them while keeping locations from anywhere else.
+
+### Organizing a library
+
+`organize` looks at a whole library rather than one trip. It groups the
+photos of every camera into events by time and place, works out what each
+folder holds and suggests where photos would rather be. Nothing is moved
+until a plan is applied:
+
+```
+$ camsync organize ~/Photos
+HOME  52.5238467, 13.4038401 (inferred: photos on the most days; override with --home)
+
+EVENTS
+#   DATES                    KIND    PHOTOS  LOCATED  CAMERAS                                       FOLDERS
+26  2024-05-10 - 2024-05-13  trip    53      13       Apple iPhone 15, Canon EOS R5, SONY ILCE-7M3  Inbox (12), Trips/Rügen Canon (20), Trips/Rügen Sony (20), 2024-05 (1)
+34  2024-09-02 - 2024-09-06  trip    40      20       Apple iPhone 15, Canon EOS R5                 Inbox (40)
+...
+
+FOLDERS
+FOLDER             KIND    PHOTOS  EVENTS  NOTE
+2024-05            period  10      10      named after a month
+Inbox              inbox   63      9       named like an inbox
+Trips/Rügen Canon  event   21      2       holds one event
+Trips/Rügen Sony   event   20      1       holds one event
+
+SUGGESTIONS
+ID  ACTION  PHOTOS  CONFIDENCE  FROM               TO                                   REASON
+s1  move    12      medium      Inbox              Trips/Rügen Canon                    part of the event kept in Trips/Rügen Canon: ...
+s2  merge   20      medium      Trips/Rügen Sony   Trips/Rügen Canon                    Trips/Rügen Sony holds the same event as Trips/Rügen Canon: ...
+s3  create  40      high        Inbox              Trips/2024-09-02 - 2024-09-06 (new)  a trip without a folder, in Inbox: ...
+s4  create  1       high        2024-03            2024-07 (new)                        taken outside 2024-03
+s5  move    1       high        Trips/Rügen Canon  Inbox                                not part of the event kept in Trips/Rügen Canon: ...
+
+NOTES
+- Panasonic DMC-TZ100: 5 photos dated from 2010-01-01 00:05; the clock looks reset, fix the dates before sorting
+```
+
+An event ends where the pause until the next photo exceeds `--gap` (default
+1d), where the location jumps further than `--jump` (default 50km) between
+located photos, or where the photos go from home to away or back. Photos are
+placed by their wall clock, so cameras whose clocks are hours apart still
+share an event; run `suggest` and `shift` per trip afterwards. A change of
+place is placed at the longest pause between the two located photos, which is
+where the travelling was done, so the photos of cameras without GPS taken in
+between fall on the right side; a single photo somewhere else, from a phone
+that stayed at home or a stale GPS fix, is ignored.
+
+Home is the place with photos on the most days, which holiday photos, many
+but on few days, do not win. `--home LAT,LON` overrides the guess and
+`--home-radius` (default 30km) says how far it reaches. An event away from
+home that runs into the next day (`--min-trip`, default 18h) is a trip, a
+shorter one an outing. Without any positions only time is known: an event
+long enough with at least `--min-trip-photos` (default 10) photos is a trip,
+and every suggestion about it has low confidence.
+
+Folders are read from their contents and their names: an **event** folder
+holds one event or a few close together, a **period** folder is named after
+a year or month (`2024`, `2024-05`, `2024/05`; `2024-05 Rügen` names an
+event), an **inbox** is where photos land before they are sorted (the root
+itself, a folder named inbox, unsorted, import, DCIM and the like, or any
+folder given with `--inbox`), and everything else is **mixed**. Suggestions
+follow from the mismatches:
+
+- **merge**: an event folder holds the same event as another one, such as a
+  folder per camera for the same trip.
+- **move**: photos of an event into the folder that holds it, whether they
+  sit in the inbox or are strays in another event folder; a stray that
+  belongs to no event kept anywhere back to the inbox; a photo out of a
+  period folder it was not taken in. An event that starts inside a month and
+  spills into the next stays where it is.
+- **create**: a trip in the inbox that has no folder yet, named after its
+  dates and placed where the other event folders are.
+- **stray**: photos that do not belong where they are, with no inbox to go to.
+
+Small events and single snaps in the inbox are left alone. Trips found inside
+period folders stay there unless `--layout trips` asks for a folder per
+trip; `--layout periods` never creates trip folders. Confidence is high when
+positions place the event on both sides, medium when one side is placed by
+time alone and low when only time says so.
+
+`--ui` opens the same picture in the browser: a timeline of the events, a
+map, the folders, and the suggestions with previews of the photos they
+concern. Change the thresholds and replan without scanning again, accept
+suggestions one by one or all of high confidence, and apply. Previews come
+from the JPEG that raw files embed, cached under the user's cache directory.
+The server listens on the loopback interface only.
+
+```sh
+camsync organize --ui --open ~/Photos
+```
+
+From the command line, `--plan plan.json` writes every suggestion with a
+destination as a plan file, a JSON list of moves to review or edit;
+`--apply plan.json` carries it out, `--dry-run` first. The browser's *Save
+plan* button writes the same file. Photos are renamed, never copied over an
+existing file, and their sidecars move with them. Catalog applications such
+as Lightroom or digiKam reference files by path and lose track of moved
+files; Immich rescans external libraries on its own.
+
+The notes report what no move can fix: photos without a date, a camera
+whose photos are dated from the first hours of a New Year's Day, which is
+where a clock starts after a reset, and photos without camera data in event
+folders, which are usually screenshots or downloads.
 
 ### Output for scripts
 

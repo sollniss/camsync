@@ -108,7 +108,8 @@ override both.`,
   camsync suggest ~/Photos/trip
   camsync shift --camera sony --by 2m30s ~/Photos/trip
   camsync shift --camera 2 --timezone +02:00 --dry-run ~/Photos/trip
-  camsync reset --camera sony ~/Photos/trip`,
+  camsync reset --camera sony ~/Photos/trip
+  camsync organize --ui ~/Photos`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -149,7 +150,7 @@ override both.`,
 		panic(err)
 	}
 
-	root.AddCommand(rt.listCommand(), rt.suggestCommand(), rt.shiftCommand(), rt.localizeCommand(), rt.geotagCommand(), rt.resetCommand())
+	root.AddCommand(rt.listCommand(), rt.suggestCommand(), rt.shiftCommand(), rt.localizeCommand(), rt.geotagCommand(), rt.resetCommand(), rt.organizeCommand())
 	return rt, root
 }
 
