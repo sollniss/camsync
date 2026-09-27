@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -115,6 +116,7 @@ func ApplyPlan(plan Plan, dryRun bool, progress func(MoveResult)) (*ApplyResult,
 	for dir := range created {
 		res.Created = append(res.Created, dir)
 	}
+	slices.Sort(res.Created)
 	return res, nil
 }
 
@@ -135,15 +137,17 @@ func applyMove(m Move, r MoveResult, dryRun bool, created map[string]bool) error
 			return err
 		}
 	}
-	if _, err := os.Stat(m.To); errors.Is(err, os.ErrNotExist) {
-		created[m.To] = true
-		if !dryRun {
-			if err := os.MkdirAll(m.To, 0o755); err != nil {
-				return err
-			}
-		}
-	} else if err != nil {
+	missing, err := missingDirs(m.To)
+	if err != nil {
 		return err
+	}
+	for _, dir := range missing {
+		created[dir] = true
+	}
+	if len(missing) > 0 && !dryRun {
+		if err := os.MkdirAll(m.To, 0o755); err != nil {
+			return err
+		}
 	}
 	if dryRun {
 		return nil
@@ -162,6 +166,27 @@ func applyMove(m Move, r MoveResult, dryRun bool, created map[string]bool) error
 		return fmt.Errorf("sidecar: %w", err)
 	}
 	return nil
+}
+
+// missingDirs returns dir and those of its parents that do not exist yet,
+// which is what MkdirAll would create.
+func missingDirs(dir string) ([]string, error) {
+	var missing []string
+	for {
+		_, err := os.Stat(dir)
+		if err == nil {
+			return missing, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		missing = append(missing, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return missing, nil
+		}
+		dir = parent
+	}
 }
 
 // moveFile renames src to dst, copying and deleting when the two are on

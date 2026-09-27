@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // gradient builds a w x h image that is red on the left and blue on the
@@ -180,5 +181,29 @@ func TestCache(t *testing.T) {
 	}
 	if _, err := c.Get(filepath.Join(dir, "missing.jpg"), 50, 0); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("missing: %v", err)
+	}
+
+	// Pruning drops the preview used least recently.
+	entries, _ = filepath.Glob(filepath.Join(dir, "cache", "*", "*.jpg"))
+	old := time.Now().Add(-48 * time.Hour)
+	for _, e := range entries {
+		if err := os.Chtimes(e, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Get(path, 100, 0); err != nil { // used again, so kept
+		t.Fatal(err)
+	}
+	freed, err := c.Prune(int64(len("cached")))
+	if err != nil || freed == 0 {
+		t.Fatalf("prune = %d, %v", freed, err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "cache", "*", "*.jpg")); len(left) != 1 {
+		t.Errorf("left = %v", left)
+	} else if data, _ := os.ReadFile(left[0]); string(data) != "cached" {
+		t.Errorf("kept the wrong preview: %q", data)
+	}
+	if freed, err := NewCache(filepath.Join(dir, "none"), 1).Prune(0); freed != 0 || err != nil {
+		t.Errorf("missing cache: %d %v", freed, err)
 	}
 }

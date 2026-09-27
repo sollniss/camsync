@@ -1,6 +1,8 @@
 package camsync
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -475,7 +477,10 @@ func (l *Library) suggest(layout Layout) {
 			return
 		}
 		s.Photos = photos
-		s.ID = fmt.Sprintf("s%d", len(l.Suggestions)+1)
+		s.ID = suggestionID(s)
+		for l.Suggestion(s.ID) != nil {
+			s.ID += "x"
+		}
 		l.Suggestions = append(l.Suggestions, s)
 	}
 	// photosIn returns the event's photos in the folder, not yet assigned.
@@ -609,6 +614,21 @@ func (l *Library) suggest(layout Layout) {
 			}
 		}
 	}
+}
+
+// suggestionID names a suggestion after what it proposes, so that the same
+// suggestion keeps its ID when the library is planned again with other
+// options, and a different suggestion never takes over the ID of another.
+func suggestionID(s *Suggestion) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00", s.Kind, s.To)
+	if s.From != nil {
+		fmt.Fprintf(h, "%s\x00", s.From.Path)
+	}
+	for _, p := range s.Photos {
+		fmt.Fprintf(h, "%s\x00", p.Path)
+	}
+	return "s" + hex.EncodeToString(h.Sum(nil))[:8]
 }
 
 // describeEvent says when the event was and, when the folders are given,

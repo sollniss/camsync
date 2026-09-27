@@ -65,7 +65,7 @@ main {
 }
 aside { overflow: auto; padding: 0 12px 12px; background: var(--panel); }
 #folders-pane { border-right: 1px solid var(--border); }
-#suggestions-pane { border-left: 1px solid var(--border); display: flex; flex-direction: column; }
+#suggestions-pane { border-left: 1px solid var(--border); display: flex; flex-direction: column; padding-bottom: 0; }
 #suggestions { flex: 1; }
 #center { display: grid; grid-template-rows: 150px 1fr 260px; min-height: 0; }
 #timeline-wrap { border-bottom: 1px solid var(--border); background: var(--panel); position: relative; }
@@ -80,12 +80,6 @@ aside { overflow: auto; padding: 0 12px 12px; background: var(--panel); }
 #map { min-height: 0; }
 #detail { overflow: auto; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--panel); }
 
-.list { list-style: none; margin: 0; padding: 0; }
-.list li { padding: 5px 6px; border-radius: 4px; cursor: pointer; display: flex; gap: 6px; align-items: baseline; }
-.list li:hover { background: #f0f2f5; }
-.list li.selected { background: #e6efff; }
-.list li .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.list li .n { color: var(--muted); font-size: 12px; }
 .badge {
   display: inline-block; font-size: 11px; padding: 0 5px; border-radius: 3px;
   background: #eee; color: #333; text-transform: uppercase; letter-spacing: 0.03em;
@@ -124,31 +118,21 @@ aside { overflow: auto; padding: 0 12px 12px; background: var(--panel); }
 .card .route .arrow { color: var(--muted); margin: 0 4px; }
 .card .route .new { color: var(--ok); font-size: 11px; margin-left: 4px; }
 .card .reason { color: var(--muted); font-size: 12px; }
-.card .link { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+
 .thumbs { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
-.thumbs img, .grid img {
-  width: 64px; height: 64px; object-fit: cover; border-radius: 3px; background: #eee; cursor: zoom-in;
-}
-.thumbs .more { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; background: #eee; border-radius: 3px; color: var(--muted); font-size: 12px; }
 .grid { display: flex; flex-wrap: wrap; gap: 4px; }
-.grid img { width: 96px; height: 96px; }
 .grid figure { margin: 0; position: relative; }
 .grid figcaption { position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; background: rgba(0,0,0,0.55); color: #fff; padding: 1px 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border-radius: 0 0 3px 3px; }
-img.broken { visibility: hidden; }
-.noprev { width: 64px; height: 64px; background: repeating-linear-gradient(45deg, #eee, #eee 6px, #f8f8f8 6px, #f8f8f8 12px); border-radius: 3px; }
 
 .notes { list-style: none; padding: 0; margin: 0 0 8px; font-size: 12px; }
 .notes li { padding: 4px 6px; border-left: 3px solid var(--warn); background: #fffbeb; margin-bottom: 4px; }
 .notes li.undated { border-color: var(--muted); background: #f9fafb; }
-.apply-bar { display: flex; gap: 6px; justify-content: flex-end; padding-top: 8px; border-top: 1px solid var(--border); position: sticky; bottom: 0; background: var(--panel); }
 
 #detail h3 { margin: 0 0 4px; font-size: 14px; }
 #detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 4px 0 8px; font-size: 13px; }
 #detail dt { color: var(--muted); }
 #detail dd { margin: 0; }
 #detail .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
-.chip { border: 1px solid var(--border); border-radius: 12px; padding: 1px 8px; font-size: 12px; cursor: pointer; background: var(--panel); }
-.chip:hover { border-color: #999; }
 
 dialog { border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-width: min(90vw, 1300px); }
 dialog::backdrop { background: rgba(0,0,0,0.4); }
@@ -174,3 +158,75 @@ dialog::backdrop { background: rgba(0,0,0,0.4); }
 .tl-event.selected { stroke: #000; stroke-width: 2; }
 .tl-event.dim { opacity: 0.35; }
 .tl-row { font-size: 10px; fill: var(--muted); }
+
+/* Buttons that read as links, so that everything clickable is reachable
+   with the keyboard. */
+button.link { border: 0; padding: 0; background: none; font: inherit; color: var(--accent); cursor: pointer; text-decoration: underline dotted; text-align: left; }
+button.link:hover { text-decoration: underline; }
+button.link.small { font-size: 11px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chip { border: 1px solid var(--border); border-radius: 12px; padding: 1px 8px; font-size: 12px; cursor: pointer; background: var(--panel); }
+.chip:hover { border-color: #999; }
+
+/* Folder tree */
+#folder-filter { width: 100%; margin-bottom: 6px; }
+.tree { list-style: none; margin: 0; padding: 0; }
+.tree .row { display: flex; gap: 2px; align-items: center; padding-left: calc(var(--depth, 0) * 12px); }
+.tree .twisty { flex: none; width: 16px; border: 0; padding: 0; background: none; color: var(--muted); font-size: 11px; text-align: center; }
+.tree button.twisty { cursor: pointer; }
+.tree .name { flex: 1; min-width: 0; display: flex; gap: 6px; align-items: baseline; padding: 4px 6px; border: 0; border-radius: 4px; background: none; font: inherit; text-align: left; }
+.tree button.name { cursor: pointer; }
+.tree button.name:hover { background: #f0f2f5; }
+.tree .name.selected { background: #e6efff; }
+.tree .name.dir { color: var(--muted); }
+.tree .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree .n { color: var(--muted); font-size: 12px; padding-right: 4px; }
+.tree .empty { padding: 4px 6px; }
+
+/* Thumbnails */
+button.thumb { display: block; padding: 0; border: 0; border-radius: 3px; background: #eee; cursor: zoom-in; width: 64px; height: 64px; overflow: hidden; }
+button.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+button.thumb.noprev { background: repeating-linear-gradient(45deg, #eee, #eee 6px, #f8f8f8 6px, #f8f8f8 12px); }
+.grid button.thumb { width: 96px; height: 96px; }
+.thumbs .more, .grid .more { width: 64px; height: 64px; padding: 0; border: 0; background: #eee; border-radius: 3px; color: var(--muted); font-size: 12px; }
+.grid .more { width: auto; height: 96px; padding: 0 12px; }
+.thumb-wrap { position: relative; }
+.thumb-wrap .exclude {
+  position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; padding: 0; line-height: 16px;
+  border-radius: 50%; border: 0; background: rgba(0,0,0,0.6); color: #fff; font-size: 13px; opacity: 0;
+}
+.thumb-wrap:hover .exclude, .thumb-wrap .exclude:focus-visible, .thumb-wrap.excluded .exclude { opacity: 1; }
+.thumb-wrap.excluded button.thumb { opacity: 0.3; filter: grayscale(1); }
+.thumb-wrap.excluded .exclude { background: var(--ok); }
+
+/* Suggestion cards */
+.card:focus-visible { outline: 2px solid var(--accent); }
+.card .route .edit { display: inline-flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.card .route .edit input { min-width: 180px; }
+
+/* Apply bar and dialogs */
+.apply-bar button { white-space: nowrap; }
+.apply-bar { display: flex; gap: 6px; align-items: center; padding: 8px 0; margin-top: auto; border-top: 1px solid var(--border); position: sticky; bottom: 0; background: var(--panel); }
+.spacer { flex: 1; }
+#apply-body h4 { margin: 12px 0 4px; font-size: 13px; }
+#apply-body th { text-align: left; font-weight: 600; color: var(--muted); padding: 2px 6px; border-bottom: 1px solid var(--border); }
+#apply-body .num { text-align: right; width: 5em; }
+#apply-body .new { color: var(--ok); font-size: 11px; margin-left: 6px; }
+.photo-side { display: flex; flex-direction: column; gap: 12px; }
+#photo-pos { min-width: 5em; text-align: center; }
+.keys td { padding: 3px 12px 3px 0; }
+kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; background: #f9fafb; }
+
+/* Toasts */
+#toasts { position: fixed; left: 50%; transform: translateX(-50%); bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 2000; max-width: 420px; }
+.toast { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border-radius: 6px; background: #1f2328; color: #fff; box-shadow: 0 4px 12px rgba(0,0,0,0.2); font-size: 13px; }
+.toast.error { background: var(--bad); }
+.toast.ok { background: var(--ok); }
+.toast .close { margin-left: auto; border: 0; background: none; color: inherit; padding: 0 2px; font-size: 16px; line-height: 1; }
+
+/* While planning or scanning */
+body.busy main { opacity: 0.6; pointer-events: none; transition: opacity 0.2s 0.15s; }
+
+/* Without map tiles */
+body.no-map #center { grid-template-rows: 150px 1fr; }
+.map-fit { background: #fff; padding: 3px 8px; font: 12px system-ui, sans-serif; cursor: pointer; }

@@ -165,6 +165,17 @@ func TestOrganizeInbox(t *testing.T) {
 	if got := suggestionText(l); len(got) != 3 || got[1] != "move Stuff -> Trips/2024-05 Rügen x1 high" {
 		t.Errorf("suggestions = %q", got)
 	}
+
+	// A suggestion keeps its ID when it comes up again with other options,
+	// and one that changed gets another, even in the same position.
+	base := Organize(root, libraryPhotos(root, lines...), LibraryOptions{})
+	periods := Organize(root, libraryPhotos(root, lines...), LibraryOptions{Layout: LayoutPeriods})
+	if base.Suggestions[0].ID != periods.Suggestions[0].ID || base.Suggestions[0].ID == base.Suggestions[1].ID {
+		t.Errorf("ids = %s %s, %s", base.Suggestions[0].ID, base.Suggestions[1].ID, periods.Suggestions[0].ID)
+	}
+	if l.Suggestions[1].ID == base.Suggestions[1].ID {
+		t.Errorf("a different suggestion took over the id %s", l.Suggestions[1].ID)
+	}
 }
 
 func TestOrganizeStraysAndPeriods(t *testing.T) {

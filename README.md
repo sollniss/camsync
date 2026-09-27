@@ -24,7 +24,7 @@ camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-
 camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--zone-gap DURATION] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
 camsync geotag   [DIR] [--camera NAME] [--gpx FILE]... [--max-gap DURATION] [--max-bridge DURATION] [--max-distance METRES] [--dry-run] [-v]
 camsync reset    [DIR] --camera NAME [--dry-run]
-camsync organize [DIR] [--ui] [--gap DURATION] [--jump DISTANCE] [--home LAT,LON] [--inbox DIR]... [--layout auto|trips|periods] [--plan FILE] [--apply FILE] [--dry-run]
+camsync organize [DIR] [--ui] [--tiles URL|none] [--gap DURATION] [--jump DISTANCE] [--home LAT,LON] [--inbox DIR]... [--layout auto|trips|periods] [--plan FILE] [--apply FILE] [--undo] [--dry-run]
 ```
 
 1. See which cameras are in the directory:
@@ -248,12 +248,12 @@ Trips/Rügen Canon  event   21      2       holds one event
 Trips/Rügen Sony   event   20      1       holds one event
 
 SUGGESTIONS
-ID  ACTION  PHOTOS  CONFIDENCE  FROM               TO                                   REASON
-s1  move    12      medium      Inbox              Trips/Rügen Canon                    part of the event kept in Trips/Rügen Canon: ...
-s2  merge   20      medium      Trips/Rügen Sony   Trips/Rügen Canon                    Trips/Rügen Sony holds the same event as Trips/Rügen Canon: ...
-s3  create  40      high        Inbox              Trips/2024-09-02 - 2024-09-06 (new)  a trip without a folder, in Inbox: ...
-s4  create  1       high        2024-03            2024-07 (new)                        taken outside 2024-03
-s5  move    1       high        Trips/Rügen Canon  Inbox                                not part of the event kept in Trips/Rügen Canon: ...
+ID         ACTION  PHOTOS  CONFIDENCE  FROM               TO                                   REASON
+s3f9a07c1  move    12      medium      Inbox              Trips/Rügen Canon                    part of the event kept in Trips/Rügen Canon: ...
+s8be2d4a0  merge   20      medium      Trips/Rügen Sony   Trips/Rügen Canon                    Trips/Rügen Sony holds the same event as Trips/Rügen Canon: ...
+s05c7e19d  create  40      high        Inbox              Trips/2024-09-02 - 2024-09-06 (new)  a trip without a folder, in Inbox: ...
+s6d14b3e8  create  1       high        2024-03            2024-07 (new)                        taken outside 2024-03
+sa2e05f73  move    1       high        Trips/Rügen Canon  Inbox                                not part of the event kept in Trips/Rügen Canon: ...
 
 NOTES
 - Panasonic DMC-TZ100: 5 photos dated from 2010-01-01 00:05; the clock looks reset, fix the dates before sorting
@@ -303,15 +303,28 @@ positions place the event on both sides, medium when one side is placed by
 time alone and low when only time says so.
 
 `--ui` opens the same picture in the browser: a timeline of the events, a
-map, the folders, and the suggestions with previews of the photos they
-concern. Change the thresholds and replan without scanning again, accept
-suggestions one by one or all of high confidence, and apply. Previews come
-from the JPEG that raw files embed, cached under the user's cache directory.
-The server listens on the loopback interface only.
+map, the folder tree, and the suggestions with previews of the photos they
+concern. Change the thresholds or mark a folder as an inbox and replan
+without scanning again. Accept suggestions one by one or all of high
+confidence, leave single photos out, and give a suggestion another
+destination (a stray gets one this way). *Apply* first shows what would
+move where and what would fail, then moves. The review is kept in the
+browser per library, and the selection in the URL, so a reload loses
+nothing. `j`/`k` go through the suggestions, `x` accepts, `e` changes the
+destination; `?` lists the rest.
 
 ```sh
 camsync organize --ui --open ~/Photos
 ```
+
+Previews come from the JPEG that raw files embed, cached under the user's
+cache directory, which is trimmed to 1 GiB. The map loads its tiles from
+OpenStreetMap, which learns which areas are looked at; `--tiles URL` uses
+another tile server and `--tiles none` shows no map. The server listens on
+the loopback interface and answers only requests addressed to an IP address,
+`localhost` or the host given with `--listen`, so other web sites cannot
+reach it by pointing a name of theirs at 127.0.0.1. Listening on another
+interface prints a warning: there is no password.
 
 From the command line, `--plan plan.json` writes every suggestion with a
 destination as a plan file, a JSON list of moves to review or edit;
@@ -320,6 +333,18 @@ plan* button writes the same file. Photos are renamed, never copied over an
 existing file, and their sidecars move with them. Catalog applications such
 as Lightroom or digiKam reference files by path and lose track of moved
 files; Immich rescans external libraries on its own.
+
+Every apply, from the browser or the command line, is recorded in
+`.camsync/journal` in the library. `--undo` (or *Undo* in the browser)
+moves the photos of the last one back and removes the folders it created
+once they are empty; repeated, it goes back further. Photos that cannot go
+back, because something else took their place, stay in the journal for the
+next try.
+
+```sh
+camsync organize --undo --dry-run ~/Photos
+camsync organize --undo ~/Photos
+```
 
 The notes report what no move can fix: photos without a date, a camera
 whose photos are dated from the first hours of a New Year's Day, which is

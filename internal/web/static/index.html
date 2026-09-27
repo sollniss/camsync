@@ -28,14 +28,17 @@
       </select>
     </label>
     <label title="Home as LAT,LON; empty to infer">home <input name="home" size="16" placeholder="inferred"></label>
-    <button type="submit">Replan</button>
+    <label title="Folders where photos land before they are sorted, relative to the library, separated by semicolons. Folders named inbox, import, DCIM and the like count anyway.">inboxes <input name="inboxes" size="14" placeholder="by name"></label>
+    <button type="submit" id="replan">Replan</button>
     <button type="button" id="rescan" title="Read the library from disk again">Rescan</button>
+    <button type="button" id="help" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
   </form>
 </header>
 <main>
-  <aside id="folders-pane">
+  <aside id="folders-pane" aria-label="Folders">
     <h2>Folders <span id="folder-count" class="count"></span></h2>
-    <ul id="folders" class="list"></ul>
+    <input id="folder-filter" type="search" placeholder="Filter folders (/)" aria-label="Filter folders">
+    <ul id="folders" class="tree"></ul>
   </aside>
   <section id="center">
     <div id="timeline-wrap">
@@ -45,35 +48,49 @@
         <span class="swatch home"></span>home
         <span class="hint">wheel zooms, drag pans, click selects, double click resets</span>
       </div>
-      <svg id="timeline"></svg>
+      <svg id="timeline" aria-label="Timeline of the events"></svg>
     </div>
     <div id="map"></div>
-    <div id="detail"><p class="muted">Select an event on the timeline or map, or a folder on the left.</p></div>
+    <div id="detail" aria-live="polite"><p class="muted">Select an event on the timeline or map, or a folder on the left.</p></div>
   </section>
-  <aside id="suggestions-pane">
+  <aside id="suggestions-pane" aria-label="Suggestions">
     <h2>Suggestions <span id="suggestion-count" class="count"></span></h2>
     <div class="toolbar">
       <button type="button" id="accept-high" title="Accept every suggestion with high confidence">Accept high</button>
       <button type="button" id="accept-all">Accept all</button>
-      <button type="button" id="accept-none">Clear</button>
+      <button type="button" id="accept-none" title="Untick everything and forget changed destinations and left-out photos">Clear</button>
       <label><input type="checkbox" id="only-related"> only for selection</label>
     </div>
     <div id="suggestions" class="cards"></div>
+    <datalist id="folder-list"></datalist>
     <h2>Notes</h2>
     <ul id="notes" class="notes"></ul>
     <div class="apply-bar">
+      <button type="button" id="undo" disabled>Undo</button>
+      <span class="spacer"></span>
       <button type="button" id="download-plan" title="Save the accepted moves as a plan file for camsync organize --apply">Save plan</button>
       <button type="button" id="apply" class="primary" disabled>Apply 0 moves</button>
     </div>
   </aside>
 </main>
 
-<dialog id="photo-dialog">
+<div id="toasts" aria-live="polite"></div>
+
+<dialog id="photo-dialog" aria-label="Photo">
   <div class="dialog-body">
     <img id="photo-big" alt="">
-    <dl id="photo-meta"></dl>
+    <div class="photo-side">
+      <dl id="photo-meta"></dl>
+      <label id="photo-include" hidden><input type="checkbox"> move with the suggestion (x)</label>
+    </div>
   </div>
-  <form method="dialog"><button>Close</button></form>
+  <form method="dialog" class="dialog-actions">
+    <button type="button" id="photo-prev" aria-label="Previous photo">‹ Previous</button>
+    <span id="photo-pos" class="muted"></span>
+    <button type="button" id="photo-next" aria-label="Next photo">Next ›</button>
+    <span class="spacer"></span>
+    <button>Close</button>
+  </form>
 </dialog>
 
 <dialog id="apply-dialog">
@@ -83,6 +100,21 @@
     <button id="apply-cancel" value="cancel">Cancel</button>
     <button id="apply-confirm" value="confirm" class="primary">Move files</button>
   </form>
+</dialog>
+
+<dialog id="help-dialog" aria-label="Keyboard shortcuts">
+  <h2>Keyboard shortcuts</h2>
+  <table class="keys">
+    <tr><td><kbd>j</kbd> <kbd>k</kbd></td><td>next, previous suggestion</td></tr>
+    <tr><td><kbd>x</kbd> <kbd>space</kbd></td><td>accept or drop the suggestion</td></tr>
+    <tr><td><kbd>e</kbd></td><td>change its destination</td></tr>
+    <tr><td><kbd>o</kbd> <kbd>enter</kbd></td><td>show its event on the timeline and map</td></tr>
+    <tr><td><kbd>esc</kbd></td><td>clear the selection</td></tr>
+    <tr><td><kbd>/</kbd></td><td>filter the folders</td></tr>
+    <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>in a photo: previous, next</td></tr>
+    <tr><td><kbd>x</kbd></td><td>in a photo of a suggestion: leave it out or take it along</td></tr>
+  </table>
+  <form method="dialog" class="dialog-actions"><button>Close</button></form>
 </dialog>
 
 <script src="vendor/leaflet/leaflet.js"></script>

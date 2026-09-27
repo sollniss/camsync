@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"path/filepath"
+	"time"
 
 	"github.com/sollniss/camsync"
 )
@@ -91,17 +92,29 @@ type ApplyCommand struct {
 // *ValidationError.
 func (c ApplyCommand) Validate() error { return invalid(c.Plan.Validate()) }
 
+// ApplyResult is the outcome of an ApplyCommand.
+type ApplyResult struct {
+	*camsync.ApplyResult
+	// Journal is the file the moves were recorded in for UndoCommand; empty
+	// for dry runs and when nothing moved.
+	Journal string
+	// JournalErr says why the moves could not be recorded. The moves
+	// themselves have happened.
+	JournalErr error
+}
+
 // ApplyHandler executes ApplyCommand. Progress, if set, is called after
 // every move.
 type ApplyHandler struct {
 	Progress func(camsync.MoveResult)
 }
 
-// Handle moves the photos with their sidecars. A move that names no sidecar
-// takes the one found next to the photo, so plans written by hand or by the
-// UI need not know about them. Moves that fail are reported in the result;
-// the error is only non-nil when the plan itself is invalid.
-func (h ApplyHandler) Handle(ctx context.Context, cmd ApplyCommand) (*camsync.ApplyResult, error) {
+// Handle moves the photos with their sidecars and records the moves in the
+// library's journal so that UndoCommand can reverse them. A move that names
+// no sidecar takes the one found next to the photo, so plans written by hand
+// or by the UI need not know about them. Moves that fail are reported in the
+// result; the error is only non-nil when the plan itself is invalid.
+func (h ApplyHandler) Handle(ctx context.Context, cmd ApplyCommand) (*ApplyResult, error) {
 	if err := cmd.Validate(); err != nil {
 		return nil, err
 	}
@@ -116,5 +129,55 @@ func (h ApplyHandler) Handle(ctx context.Context, cmd ApplyCommand) (*camsync.Ap
 		}
 		plan.Moves[i] = m
 	}
-	return camsync.ApplyPlan(plan, cmd.DryRun, h.Progress)
+	res, err := camsync.ApplyPlan(plan, cmd.DryRun, h.Progress)
+	if err != nil {
+		return nil, err
+	}
+	out := &ApplyResult{ApplyResult: res}
+	out.Journal, out.JournalErr = camsync.WriteJournal(plan.Root, res, time.Now())
+	return out, nil
+}
+
+// UndoCommand moves the photos of the plan last applied to a library back
+// where they were. Repeated, it walks back through earlier plans.
+type UndoCommand struct {
+	Root   string
+	DryRun bool
+}
+
+// Validate reports whether the command can be executed. A failure is a
+// *ValidationError.
+func (c UndoCommand) Validate() error { return invalid(Scope{Dir: c.Root}.validate()) }
+
+// UndoResult is the outcome of an UndoCommand.
+type UndoResult struct {
+	*camsync.ApplyResult
+	Applied time.Time // when the undone plan was applied
+}
+
+// UndoHandler executes UndoCommand. Progress, if set, is called after every
+// move.
+type UndoHandler struct {
+	Progress func(camsync.MoveResult)
+}
+
+// Handle undoes the last plan applied to the library, or returns
+// camsync.ErrNothingToUndo. Moves that fail stay in the journal to be
+// retried.
+func (h UndoHandler) Handle(ctx context.Context, cmd UndoCommand) (*UndoResult, error) {
+	if err := cmd.Validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	j, path, err := camsync.LastJournal(cmd.Root)
+	if err != nil {
+		return nil, err
+	}
+	res, err := camsync.Undo(j, path, cmd.DryRun, h.Progress)
+	if res == nil {
+		return nil, err
+	}
+	return &UndoResult{ApplyResult: res, Applied: j.Time}, err
 }

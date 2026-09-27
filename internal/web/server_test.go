@@ -82,7 +82,7 @@ func newServer(t *testing.T, root string) (*Server, *httptest.Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(scope, res, preview.NewCache(filepath.Join(t.TempDir(), "cache"), 1))
+	s := New(scope, res, preview.NewCache(filepath.Join(t.TempDir(), "cache"), 1), Config{Tiles: OSMTiles})
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -121,6 +121,24 @@ func post(t *testing.T, ts *httptest.Server, path string, body any, headers map[
 	return res, out.Bytes()
 }
 
+func postForm(t *testing.T, ts *httptest.Server, path string, form url.Values, v any) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Camsync", "1")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if v != nil && res.StatusCode == 200 {
+		if err := json.NewDecoder(res.Body).Decode(v); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
+	return res
+}
+
 func TestLibraryAndOptions(t *testing.T) {
 	root := library(t)
 	_, ts := newServer(t, root)
@@ -143,22 +161,75 @@ func TestLibraryAndOptions(t *testing.T) {
 		t.Errorf("event = %+v", e)
 	}
 
-	// Replanning with a tiny gap splits the days.
-	if res := getJSON(t, ts, "/api/library?gap=1h&layout=periods&home=52.52,13.40", &lib); res.StatusCode != 200 {
+	// Planning needs the header like every change.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/plan", strings.NewReader("gap=1h"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if res, err := http.DefaultClient.Do(req); err != nil || res.StatusCode != 403 {
+		t.Errorf("plan without header: %v %v", res, err)
+	}
+
+	// Replanning with a tiny gap splits the days and sends the plan alone.
+	var raw map[string]json.RawMessage
+	if res := postForm(t, ts, "/api/plan", url.Values{"gap": {"1h"}, "layout": {"periods"}, "home": {"52.52,13.40"}, "inbox": {"Inbox"}}, &raw); res.StatusCode != 200 {
 		t.Fatal(res.Status)
 	}
-	if len(lib.Events) < 3 || lib.Options.Gap != "1h" || lib.Options.Layout != "periods" || lib.Home == nil || lib.Home.Inferred || lib.Options.Home == "" {
-		t.Errorf("replanned = %d events, options %+v, home %+v", len(lib.Events), lib.Options, lib.Home)
+	if _, ok := raw["photos"]; ok {
+		t.Error("the plan carries the photos")
+	}
+	var plan PlanJSON
+	postForm(t, ts, "/api/plan", url.Values{}, &plan)
+	if len(plan.Events) < 3 || plan.Options.Gap != "1h" || plan.Options.Layout != "periods" || plan.Home == nil || plan.Home.Inferred || plan.Options.Home == "" {
+		t.Errorf("replanned = %d events, options %+v, home %+v", len(plan.Events), plan.Options, plan.Home)
+	}
+	if len(plan.Options.Inboxes) != 1 || plan.Options.Inboxes[0] != "Inbox" {
+		t.Errorf("inboxes = %v", plan.Options.Inboxes)
 	}
 	// The options stick, and an empty home infers again.
-	getJSON(t, ts, "/api/library?home=", &lib)
-	if lib.Options.Gap != "1h" || !lib.Home.Inferred {
-		t.Errorf("after clearing home: %+v %+v", lib.Options, lib.Home)
+	postForm(t, ts, "/api/plan", url.Values{"home": {""}}, &plan)
+	if plan.Options.Gap != "1h" || !plan.Home.Inferred {
+		t.Errorf("after clearing home: %+v %+v", plan.Options, plan.Home)
 	}
-	for _, q := range []string{"gap=-1", "gap=abc", "jump=0", "layout=weekly", "home=x", "minTripPhotos=0"} {
-		if res := getJSON(t, ts, "/api/library?"+q, nil); res.StatusCode != 400 {
-			t.Errorf("%s: %s", q, res.Status)
+	getJSON(t, ts, "/api/library", &lib)
+	if lib.Options.Gap != "1h" || len(lib.Photos) != 15 {
+		t.Errorf("library after planning: %+v", lib.Options)
+	}
+	for _, q := range []url.Values{{"gap": {"-1"}}, {"gap": {"abc"}}, {"jump": {"0"}}, {"layout": {"weekly"}}, {"home": {"x"}}, {"minTripPhotos": {"0"}}} {
+		if res := postForm(t, ts, "/api/plan", q, nil); res.StatusCode != 400 {
+			t.Errorf("%s: %s", q.Encode(), res.Status)
 		}
+	}
+}
+
+func TestHost(t *testing.T) {
+	root := library(t)
+	s, ts := newServer(t, root)
+	get := func(host string) int {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/library", nil)
+		req.Host = host
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		return res.StatusCode
+	}
+	for _, host := range []string{"127.0.0.1:8080", "localhost:8080", "[::1]:8080", "192.168.1.5:8080", "camsync.localhost"} {
+		if code := get(host); code != 200 {
+			t.Errorf("%s: %d", host, code)
+		}
+	}
+	// A name that someone else's DNS resolves to the loopback address.
+	if code := get("evil.example:8080"); code != 403 {
+		t.Errorf("rebound name: %d", code)
+	}
+	s.AllowHost("nas")
+	if code := get("NAS:8080"); code != 200 {
+		t.Errorf("allowed name: %d", code)
+	}
+	var cfg configView
+	getJSON(t, ts, "/api/config", &cfg)
+	if cfg.Tiles != OSMTiles || !strings.Contains(cfg.Attribution, "OpenStreetMap") {
+		t.Errorf("config = %+v", cfg)
 	}
 }
 
@@ -255,6 +326,73 @@ func TestApplyAndRescan(t *testing.T) {
 	res, body = post(t, ts, "/api/rescan", nil, headers)
 	if err := json.Unmarshal(body, &lib); err != nil || res.StatusCode != 200 || len(lib.Photos) != 15 {
 		t.Errorf("rescan: %s %s", res.Status, body)
+	}
+}
+
+func TestDestinationAndUndo(t *testing.T) {
+	root := library(t)
+	_, ts := newServer(t, root)
+	headers := map[string]string{"X-Camsync": "1"}
+	var lib LibraryJSON
+	getJSON(t, ts, "/api/library", &lib)
+	s := lib.Suggestions[0]
+	var moves []camsync.Move
+	for _, i := range s.Photos {
+		moves = append(moves, camsync.Move{Path: lib.Photos[i].Path, To: "Trips/2024 Rügen"})
+	}
+
+	// Nothing to undo yet.
+	var j *journalView
+	getJSON(t, ts, "/api/journal", &j)
+	if j != nil {
+		t.Errorf("journal before apply = %+v", j)
+	}
+	if res, _ := post(t, ts, "/api/undo", undoRequest{}, headers); res.StatusCode != 409 {
+		t.Errorf("undo without journal: %s", res.Status)
+	}
+	// Hidden folders are no destination.
+	hidden := []camsync.Move{{Path: moves[0].Path, To: ".camsync/x"}}
+	if res, body := post(t, ts, "/api/apply", applyRequest{Moves: hidden}, headers); res.StatusCode != 400 || !strings.Contains(string(body), "hidden") {
+		t.Errorf("hidden: %s %s", res.Status, body)
+	}
+
+	// A destination relative to the root, typed in the browser.
+	res, body := post(t, ts, "/api/apply", applyRequest{Moves: moves}, headers)
+	var out applyResponse
+	if err := json.Unmarshal(body, &out); err != nil || res.StatusCode != 200 {
+		t.Fatalf("apply: %s %s", res.Status, body)
+	}
+	fresh := filepath.Join(root, "Trips", "2024 Rügen")
+	if out.Moved != 2 || len(out.Created) != 1 || out.Created[0] != fresh || out.Undo == nil || out.Undo.Moves != 2 || out.JournalError != "" {
+		t.Fatalf("apply = %+v", out)
+	}
+	if _, err := os.Stat(filepath.Join(fresh, "p2.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	getJSON(t, ts, "/api/journal", &j)
+	if j == nil || j.Moves != 2 {
+		t.Errorf("journal = %+v", j)
+	}
+
+	// A dry run of the undo moves nothing; the undo moves everything back
+	// and removes the folder the apply created.
+	out = applyResponse{}
+	res, body = post(t, ts, "/api/undo", undoRequest{DryRun: true}, headers)
+	if err := json.Unmarshal(body, &out); err != nil || res.StatusCode != 200 || !out.DryRun || out.Moved != 2 || out.Library != nil {
+		t.Errorf("undo dry run: %s %s", res.Status, body)
+	}
+	out = applyResponse{}
+	res, body = post(t, ts, "/api/undo", undoRequest{}, headers)
+	if err := json.Unmarshal(body, &out); err != nil || res.StatusCode != 200 || out.Moved != 2 || out.Undo != nil || out.Library == nil || len(out.Library.Suggestions) != 1 {
+		t.Fatalf("undo: %s %s", res.Status, body)
+	}
+	for _, m := range moves {
+		if _, err := os.Stat(m.Path); err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
+		t.Errorf("created folder left behind: %v", err)
 	}
 }
 

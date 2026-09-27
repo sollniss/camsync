@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,8 +24,8 @@ import (
 )
 
 func (rt *runtime) organizeCommand() *cobra.Command {
-	var ui, open, dryRun, verbose bool
-	var listen, planFile, applyFile, gap, jump, home, homeRadius, minTrip, layout string
+	var ui, open, dryRun, verbose, undo bool
+	var listen, tiles, planFile, applyFile, gap, jump, home, homeRadius, minTrip, layout string
 	var minTripPhotos int
 	var inboxes []string
 	cmd := &cobra.Command{
@@ -63,20 +64,30 @@ positions at all. --layout trips also pulls trips out of period folders;
 --layout periods never creates trip folders.
 
 --ui opens the same picture in the browser with a timeline, a map and
-previews, where suggestions can be accepted one by one and applied.
+previews, where suggestions can be accepted one by one and applied. The
+map loads its tiles from OpenStreetMap, which learns which areas are
+looked at; --tiles none turns it off.
 --plan writes every suggestion with a destination to a file to review by
 hand; --apply carries out such a file, or one saved from the browser.
-Moving files confuses catalog applications such as Lightroom, which
-reference files by path.`,
+Every applied plan is recorded under DIR/.camsync/journal, and --undo
+moves its photos back. Moving files confuses catalog applications such as
+Lightroom, which reference files by path.`,
 		Example: `  camsync organize ~/Photos
   camsync organize --ui ~/Photos
   camsync organize --inbox Inbox --home 52.52,13.40 ~/Photos
   camsync organize --plan plan.json ~/Photos && camsync organize --apply plan.json --dry-run
+  camsync organize --undo ~/Photos
   camsync organize --gap 12h --jump 20km --layout trips -o json ~/Photos`,
 		Args:              dirArgs,
 		ValidArgsFunction: completeDirs,
 		RunE: rt.runE(func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
+			if undo && applyFile != "" {
+				return usage(errors.New("--undo and --apply exclude each other"))
+			}
+			if undo {
+				return rt.undo(cmd.Context(), out, rt.scope(args).Dir, dryRun, verbose)
+			}
 			if applyFile != "" {
 				return rt.applyPlan(cmd.Context(), out, applyFile, dryRun, verbose)
 			}
@@ -109,7 +120,7 @@ reference files by path.`,
 				return err
 			}
 			if ui {
-				return serveUI(cmd.Context(), cmd.ErrOrStderr(), q.Scope, res, listen, open)
+				return serveUI(cmd.Context(), cmd.ErrOrStderr(), q.Scope, res, listen, open, web.Config{Tiles: tileURL(tiles)})
 			}
 			if planFile != "" {
 				if err := writePlan(planFile, res); err != nil {
@@ -125,10 +136,12 @@ reference files by path.`,
 	f := cmd.Flags()
 	f.BoolVar(&ui, "ui", false, "open the library in the browser instead of printing")
 	f.StringVar(&listen, "listen", "127.0.0.1:0", "address the --ui server listens on")
+	f.StringVar(&tiles, "tiles", web.OSMTiles, `map tiles of the --ui, as a URL with {z}, {x} and {y}, or "none" for no map`)
 	f.BoolVar(&open, "open", false, "with --ui, open the browser")
 	f.StringVar(&planFile, "plan", "", "write the suggestions as a plan file to apply later")
 	f.StringVar(&applyFile, "apply", "", "carry out the moves of a plan file instead of scanning")
-	f.BoolVarP(&dryRun, "dry-run", "n", false, "with --apply, report what would move without moving anything")
+	f.BoolVar(&undo, "undo", false, "move the photos of the plan last applied to DIR back; repeat to go further back")
+	f.BoolVarP(&dryRun, "dry-run", "n", false, "with --apply or --undo, report what would move without moving anything")
 	f.StringVar(&gap, "gap", "", "pause in shooting that separates two events (default 1d)")
 	f.StringVar(&jump, "jump", "", "distance between consecutive located photos that separates two events, e.g. 20km (default 50km)")
 	f.StringVar(&home, "home", "", "where the photos' owner lives, as LAT,LON (default: inferred)")
@@ -147,7 +160,7 @@ reference files by path.`,
 		"inbox": func(_ *cobra.Command, _ []string, _ string) ([]cobra.Completion, cobra.ShellCompDirective) {
 			return nil, cobra.ShellCompDirectiveFilterDirs
 		},
-		"gap": noFileComp, "jump": noFileComp, "home": noFileComp, "home-radius": noFileComp, "min-trip": noFileComp, "min-trip-photos": noFileComp, "listen": noFileComp,
+		"gap": noFileComp, "jump": noFileComp, "home": noFileComp, "home-radius": noFileComp, "min-trip": noFileComp, "min-trip-photos": noFileComp, "listen": noFileComp, "tiles": noFileComp,
 	})
 	for _, name := range []string{"plan", "apply"} {
 		if err := cmd.MarkFlagFilename(name, "json"); err != nil {
@@ -180,13 +193,39 @@ func parseDistances(flags ...distanceFlag) error {
 	return nil
 }
 
+// tileURL reads the --tiles flag: "none" or empty for no map.
+func tileURL(flag string) string {
+	if strings.EqualFold(flag, "none") {
+		return ""
+	}
+	return flag
+}
+
+// loopback reports whether a listen address only accepts connections from
+// this machine.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // serveUI runs the browser interface until the context is cancelled.
-func serveUI(ctx context.Context, msgs io.Writer, scope app.Scope, res *app.OrganizeResult, listen string, open bool) error {
+func serveUI(ctx context.Context, msgs io.Writer, scope app.Scope, res *app.OrganizeResult, listen string, open bool, cfg web.Config) error {
 	var cache *preview.Cache
 	if dir, err := preview.DefaultCacheDir(); err == nil {
 		cache = preview.NewCache(dir, 0)
+		go func() { _, _ = cache.Prune(preview.DefaultCacheLimit) }()
 	}
-	srv := web.New(scope, res, cache)
+	if !loopback(listen) {
+		fmt.Fprintf(msgs, "warning: listening on %s without authentication; anyone who can reach it can see and move the photos\n", listen)
+	}
+	srv := web.New(scope, res, cache, cfg)
 	err := web.Serve(ctx, listen, srv, func(url string) {
 		fmt.Fprintf(msgs, "Serving %s at %s (Ctrl-C to stop)\n", scope.Dir, url)
 		if open {
@@ -246,31 +285,68 @@ func (rt *runtime) applyPlan(ctx context.Context, out io.Writer, path string, dr
 	if err != nil {
 		return err
 	}
-	if rt.json() {
-		if err := writeJSON(out, applyView(res)); err != nil {
-			return err
-		}
-	} else {
-		if !verbose {
-			for _, r := range res.Results {
-				if r.Err != nil {
-					printMove(out, r)
-				}
-			}
-		}
-		prefix := ""
-		if res.DryRun {
-			prefix = "dry run: "
-		}
-		fmt.Fprintf(out, "%s%d photos moved, %d failed", prefix, res.Moved, res.Failed)
-		if len(res.Created) > 0 {
-			fmt.Fprintf(out, ", %d folders created", len(res.Created))
-		}
-		fmt.Fprintln(out)
+	if err := rt.printApply(out, res.ApplyResult, verbose, "moved"); err != nil {
+		return err
+	}
+	if res.JournalErr != nil {
+		return fmt.Errorf("the moves could not be recorded for --undo: %w", res.JournalErr)
+	}
+	if res.Journal != "" && !rt.json() {
+		fmt.Fprintf(out, "Recorded in %s; undo with: camsync organize --undo %s\n", res.Journal, plan.Root)
 	}
 	if res.Failed > 0 {
 		return fmt.Errorf("%d photos could not be moved", res.Failed)
 	}
+	return nil
+}
+
+// undo moves the photos of the plan last applied to root back.
+func (rt *runtime) undo(ctx context.Context, out io.Writer, root string, dryRun, verbose bool) error {
+	h := app.UndoHandler{}
+	if verbose && !rt.json() {
+		h.Progress = func(r camsync.MoveResult) { printMove(out, r) }
+	}
+	res, err := h.Handle(ctx, app.UndoCommand{Root: root, DryRun: dryRun})
+	if res == nil {
+		return err
+	}
+	if !rt.json() {
+		fmt.Fprintf(out, "Undoing the plan applied %s\n", res.Applied.Local().Format("2006-01-02 15:04:05"))
+	}
+	if err := rt.printApply(out, res.ApplyResult, verbose, "moved back"); err != nil {
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if res.Failed > 0 {
+		return fmt.Errorf("%d photos could not be moved back; they stay in the journal to try again", res.Failed)
+	}
+	return nil
+}
+
+// printApply reports the outcome of moving photos: the failures, or every
+// move with verbose, and a summary.
+func (rt *runtime) printApply(out io.Writer, res *camsync.ApplyResult, verbose bool, moved string) error {
+	if rt.json() {
+		return writeJSON(out, applyView(res))
+	}
+	if !verbose {
+		for _, r := range res.Results {
+			if r.Err != nil {
+				printMove(out, r)
+			}
+		}
+	}
+	prefix := ""
+	if res.DryRun {
+		prefix = "dry run: "
+	}
+	fmt.Fprintf(out, "%s%d photos %s, %d failed", prefix, res.Moved, moved, res.Failed)
+	if len(res.Created) > 0 {
+		fmt.Fprintf(out, ", %d folders created", len(res.Created))
+	}
+	fmt.Fprintln(out)
 	return nil
 }
 

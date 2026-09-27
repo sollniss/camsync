@@ -659,7 +659,7 @@ func TestOrganizeReportPlanAndApply(t *testing.T) {
 	if code != 0 || errOut != "" {
 		t.Fatalf("code %d, stderr %q", code, errOut)
 	}
-	for _, want := range []string{"HOME  ", "EVENTS", "FOLDERS", "Inbox", "inbox", "Trips/Rügen", "event", "SUGGESTIONS", "s1  move    2       high", "1 suggestions, 2 photos to move"} {
+	for _, want := range []string{"HOME  ", "EVENTS", "FOLDERS", "Inbox", "inbox", "Trips/Rügen", "event", "SUGGESTIONS", "  move    2       high", "1 suggestions, 2 photos to move"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report lacks %q:\n%s", want, out)
 		}
@@ -727,5 +727,26 @@ func TestOrganizeReportPlanAndApply(t *testing.T) {
 	}
 	if code, _, _ := run(t, "organize", "--apply", filepath.Join(root, "missing.json")); code != ExitFailure {
 		t.Errorf("missing plan: %d", code)
+	}
+
+	// Undo the apply: a dry run first, then for real, then nothing is left.
+	code, out, _ = run(t, "organize", "--undo", "--dry-run", root)
+	if code != 0 || !strings.Contains(out, "Undoing the plan applied") || !strings.Contains(out, "dry run: 2 photos moved back, 0 failed") {
+		t.Errorf("undo dry run: %d\n%s", code, out)
+	}
+	code, out, _ = run(t, "organize", "--undo", root)
+	if code != 0 || !strings.Contains(out, "2 photos moved back, 0 failed") {
+		t.Errorf("undo: %d\n%s", code, out)
+	}
+	for _, name := range []string{"p2.jpg", "p3.jpg", "p3.jpg.xmp"} {
+		if _, err := os.Stat(filepath.Join(root, "Inbox", name)); err != nil {
+			t.Error(err)
+		}
+	}
+	if code, _, errOut := run(t, "organize", "--undo", root); code != ExitFailure || !strings.Contains(errOut, "nothing to undo") {
+		t.Errorf("undo again: %d %s", code, errOut)
+	}
+	if code, _, _ := run(t, "organize", "--undo", "--apply", plan, root); code != ExitUsage {
+		t.Errorf("--undo with --apply: %d", code)
 	}
 }

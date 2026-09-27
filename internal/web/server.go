@@ -1,8 +1,10 @@
 // Package web serves the organize user interface: a local HTTP server with
 // a JSON API over the application layer and an embedded single-page front
-// end. It binds to the loopback interface and refuses to leave the library:
-// previews are served for scanned photos only and moves are validated
-// against the root before they are applied.
+// end. It refuses to leave the library: previews are served for scanned
+// photos only and moves are validated against the root before they are
+// applied. Requests must name the server by an IP address, localhost or
+// the host it was told to listen on, which keeps pages of other sites out
+// even when they make their own name resolve to the loopback address.
 package web
 
 import (
@@ -32,35 +34,87 @@ var static embed.FS
 // MaxPreviewSize is the largest preview the API renders.
 const MaxPreviewSize = 1600
 
+// OSMTiles are the OpenStreetMap tiles, the default map.
+const OSMTiles = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+
+const osmAttribution = `&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>`
+
+// Config is what the front end is told about its surroundings.
+type Config struct {
+	// Tiles is the URL template of the map tiles, with {z}, {x} and {y};
+	// empty hides the map.
+	Tiles string
+}
+
 // Server holds one scanned library and answers the front end.
 type Server struct {
-	mu     sync.RWMutex
+	mu     sync.RWMutex // guards res, byPath and hosts
+	op     sync.Mutex   // one change to the library at a time
 	scope  app.Scope
 	res    *app.OrganizeResult
 	byPath map[string]*camsync.Photo
+	hosts  map[string]bool
 	cache  *preview.Cache
+	cfg    Config
 	mux    *http.ServeMux
 }
 
 // New wraps a scanned library. cache may be nil, in which case previews
 // are rendered on every request.
-func New(scope app.Scope, res *app.OrganizeResult, cache *preview.Cache) *Server {
-	s := &Server{scope: scope, cache: cache, mux: http.NewServeMux()}
+func New(scope app.Scope, res *app.OrganizeResult, cache *preview.Cache, cfg Config) *Server {
+	s := &Server{scope: scope, cache: cache, cfg: cfg, hosts: map[string]bool{}, mux: http.NewServeMux()}
 	s.set(res)
 	sub, err := fs.Sub(static, "static")
 	if err != nil {
 		panic(err)
 	}
 	s.mux.Handle("GET /", http.FileServerFS(sub))
+	s.mux.HandleFunc("GET /api/config", s.config)
 	s.mux.HandleFunc("GET /api/library", s.library)
+	s.mux.HandleFunc("POST /api/plan", s.plan)
 	s.mux.HandleFunc("POST /api/rescan", s.rescan)
 	s.mux.HandleFunc("GET /api/preview", s.preview)
 	s.mux.HandleFunc("POST /api/apply", s.apply)
+	s.mux.HandleFunc("GET /api/journal", s.journal)
+	s.mux.HandleFunc("POST /api/undo", s.undo)
 	return s
 }
 
 // Handler returns the HTTP handler.
-func (s *Server) Handler() http.Handler { return s.mux }
+func (s *Server) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.knownHost(r.Host) {
+			http.Error(w, "unknown host "+r.Host, http.StatusForbidden)
+			return
+		}
+		s.mux.ServeHTTP(w, r)
+	})
+}
+
+// AllowHost lets requests name the server by host, in addition to IP
+// addresses and localhost.
+func (s *Server) AllowHost(host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hosts[strings.ToLower(strings.TrimSuffix(host, "."))] = true
+}
+
+// knownHost reports whether a Host header names this server. A page whose
+// own name was made to resolve to the loopback address (DNS rebinding)
+// sends that name and is refused.
+func (s *Server) knownHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || net.ParseIP(host) != nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hosts[host]
+}
 
 func (s *Server) set(res *app.OrganizeResult) {
 	s.mu.Lock()
@@ -72,12 +126,21 @@ func (s *Server) set(res *app.OrganizeResult) {
 	}
 }
 
+func (s *Server) current() (*app.OrganizeResult, map[string]*camsync.Photo) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.res, s.byPath
+}
+
 // Serve listens on addr, tells ready the URL, and serves until ctx is
 // cancelled. addr may end in ":0" to pick a free port.
 func Serve(ctx context.Context, addr string, s *Server, ready func(url string)) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
+	}
+	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" && net.ParseIP(host) == nil {
+		s.AllowHost(host)
 	}
 	srv := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	host, port, _ := net.SplitHostPort(ln.Addr().String())
@@ -132,13 +195,42 @@ func writeError(w http.ResponseWriter, err error, status int) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 }
 
-// library answers with the library planned with the options in the query,
-// or the current ones when the query has none.
-func (s *Server) library(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	res := s.res
-	s.mu.RUnlock()
-	opts, changed, err := parseOptions(r.URL.Query(), res.Options)
+type configView struct {
+	Tiles       string `json:"tiles"`
+	Attribution string `json:"attribution"`
+}
+
+func (s *Server) config(w http.ResponseWriter, _ *http.Request) {
+	v := configView{Tiles: s.cfg.Tiles}
+	if s.cfg.Tiles == OSMTiles {
+		v.Attribution = osmAttribution
+	} else if u, err := url.Parse(s.cfg.Tiles); err == nil && u.Host != "" {
+		v.Attribution = "tiles: " + u.Host
+	}
+	writeJSON(w, v)
+}
+
+// library answers with the photos and the current plan.
+func (s *Server) library(w http.ResponseWriter, _ *http.Request) {
+	res, _ := s.current()
+	writeJSON(w, libraryView(res))
+}
+
+// plan plans the scanned photos again with the options in the form and
+// answers with the plan alone; the photos stay what they were.
+func (s *Server) plan(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := r.ParseForm(); err != nil {
+		writeError(w, fmt.Errorf("bad request: %w", err), http.StatusBadRequest)
+		return
+	}
+	s.op.Lock()
+	defer s.op.Unlock()
+	res, _ := s.current()
+	opts, changed, err := parseOptions(r.PostForm, res.Root, res.Options)
 	if err != nil {
 		writeError(w, err, http.StatusBadRequest)
 		return
@@ -147,7 +239,7 @@ func (s *Server) library(w http.ResponseWriter, r *http.Request) {
 		res = res.With(opts)
 		s.set(res)
 	}
-	writeJSON(w, libraryView(res))
+	writeJSON(w, planView(res))
 }
 
 // rescan reads the library from disk again with the current options.
@@ -155,24 +247,33 @@ func (s *Server) rescan(w http.ResponseWriter, r *http.Request) {
 	if !sameOrigin(w, r) {
 		return
 	}
-	s.mu.RLock()
-	opts := s.res.Options
-	s.mu.RUnlock()
-	res, err := app.OrganizeHandler{}.Handle(r.Context(), app.OrganizeQuery{Scope: s.scope, Options: opts})
+	s.op.Lock()
+	defer s.op.Unlock()
+	res, err := s.scan(r.Context())
 	if err != nil {
 		writeError(w, err, http.StatusInternalServerError)
 		return
 	}
-	s.set(res)
 	writeJSON(w, libraryView(res))
+}
+
+// scan reads the library from disk with the current options and keeps it.
+// The caller holds s.op.
+func (s *Server) scan(ctx context.Context) (*app.OrganizeResult, error) {
+	cur, _ := s.current()
+	res, err := app.OrganizeHandler{}.Handle(ctx, app.OrganizeQuery{Scope: s.scope, Options: cur.Options})
+	if err != nil {
+		return nil, err
+	}
+	s.set(res)
+	return res, nil
 }
 
 // preview serves a scaled JPEG of a scanned photo.
 func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	s.mu.RLock()
-	p := s.byPath[path]
-	s.mu.RUnlock()
+	_, byPath := s.current()
+	p := byPath[path]
 	if p == nil {
 		http.Error(w, "not a photo of this library", http.StatusNotFound)
 		return
@@ -212,12 +313,14 @@ type applyRequest struct {
 }
 
 type applyResponse struct {
-	Moved   int              `json:"moved"`
-	Failed  int              `json:"failed"`
-	DryRun  bool             `json:"dryRun"`
-	Created []string         `json:"created"`
-	Results []moveResultView `json:"results"`
-	Library *LibraryJSON     `json:"library,omitempty"`
+	Moved        int              `json:"moved"`
+	Failed       int              `json:"failed"`
+	DryRun       bool             `json:"dryRun"`
+	Created      []string         `json:"created"`
+	Results      []moveResultView `json:"results"`
+	JournalError string           `json:"journalError,omitempty"`
+	Undo         *journalView     `json:"undo"`
+	Library      *LibraryJSON     `json:"library,omitempty"`
 }
 
 type moveResultView struct {
@@ -227,41 +330,13 @@ type moveResultView struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// apply moves the given photos and, unless it was a dry run, rescans.
-func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
-	if !sameOrigin(w, r) {
-		return
-	}
-	var req applyRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20)).Decode(&req); err != nil {
-		writeError(w, fmt.Errorf("bad request: %w", err), http.StatusBadRequest)
-		return
-	}
-	s.mu.RLock()
-	root, opts := s.res.Root, s.res.Options
-	byPath := s.byPath
-	s.mu.RUnlock()
-	// Only photos of this library move, and their sidecars come from the
-	// scan rather than from the request.
-	moves := make([]camsync.Move, 0, len(req.Moves))
-	for _, m := range req.Moves {
-		p := byPath[m.Path]
-		if p == nil {
-			writeError(w, fmt.Errorf("%s is not a photo of this library", m.Path), http.StatusBadRequest)
-			return
-		}
-		moves = append(moves, camsync.Move{Path: p.Path, Sidecar: p.Sidecar, To: m.To})
-	}
-	res, err := app.ApplyHandler{}.Handle(r.Context(), app.ApplyCommand{Plan: camsync.Plan{Root: root, Moves: moves}, DryRun: req.DryRun})
-	if err != nil {
-		status := http.StatusInternalServerError
-		var verr *app.ValidationError
-		if errors.As(err, &verr) {
-			status = http.StatusBadRequest
-		}
-		writeError(w, err, status)
-		return
-	}
+type journalView struct {
+	Time    string `json:"time"`
+	Moves   int    `json:"moves"`
+	Created int    `json:"created"`
+}
+
+func newApplyResponse(res *camsync.ApplyResult) applyResponse {
 	out := applyResponse{Moved: res.Moved, Failed: res.Failed, DryRun: res.DryRun, Created: res.Created, Results: []moveResultView{}}
 	if out.Created == nil {
 		out.Created = []string{}
@@ -273,20 +348,144 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Results = append(out.Results, v)
 	}
-	if !req.DryRun && res.Moved > 0 {
-		fresh, err := app.OrganizeHandler{}.Handle(r.Context(), app.OrganizeQuery{Scope: s.scope, Options: opts})
-		if err == nil {
-			s.set(fresh)
-			lib := libraryView(fresh)
-			out.Library = &lib
-		}
+	return out
+}
+
+// finish completes the answer to an apply or undo: the journal left to
+// undo and, when files moved, the library scanned again.
+func (s *Server) finish(ctx context.Context, out *applyResponse, root string) {
+	out.Undo = lastJournal(root)
+	if out.DryRun || out.Moved == 0 {
+		return
 	}
+	if fresh, err := s.scan(ctx); err == nil {
+		lib := libraryView(fresh)
+		out.Library = &lib
+	}
+}
+
+// apply moves the given photos and, unless it was a dry run, rescans. A
+// destination may be given relative to the root, with slashes.
+func (s *Server) apply(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(w, r) {
+		return
+	}
+	var req applyRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20)).Decode(&req); err != nil {
+		writeError(w, fmt.Errorf("bad request: %w", err), http.StatusBadRequest)
+		return
+	}
+	s.op.Lock()
+	defer s.op.Unlock()
+	res, byPath := s.current()
+	// Only photos of this library move, and their sidecars come from the
+	// scan rather than from the request.
+	moves := make([]camsync.Move, 0, len(req.Moves))
+	for _, m := range req.Moves {
+		p := byPath[m.Path]
+		if p == nil {
+			writeError(w, fmt.Errorf("%s is not a photo of this library", m.Path), http.StatusBadRequest)
+			return
+		}
+		to, err := destination(res.Root, m.To)
+		if err != nil {
+			writeError(w, err, http.StatusBadRequest)
+			return
+		}
+		moves = append(moves, camsync.Move{Path: p.Path, Sidecar: p.Sidecar, To: to})
+	}
+	ar, err := app.ApplyHandler{}.Handle(r.Context(), app.ApplyCommand{Plan: camsync.Plan{Root: res.Root, Moves: moves}, DryRun: req.DryRun})
+	if err != nil {
+		status := http.StatusInternalServerError
+		var verr *app.ValidationError
+		if errors.As(err, &verr) {
+			status = http.StatusBadRequest
+		}
+		writeError(w, err, status)
+		return
+	}
+	out := newApplyResponse(ar.ApplyResult)
+	if ar.JournalErr != nil {
+		out.JournalError = ar.JournalErr.Error()
+	}
+	s.finish(r.Context(), &out, res.Root)
 	writeJSON(w, out)
 }
 
-// parseOptions reads the planning options from a query, starting from the
+// destination resolves a destination directory against the root. Hidden
+// directories are refused: scans skip them, so photos moved there would
+// disappear from the library.
+func destination(root, to string) (string, error) {
+	if strings.TrimSpace(to) == "" {
+		return "", errors.New("move without destination")
+	}
+	if !filepath.IsAbs(to) {
+		to = filepath.Join(root, filepath.FromSlash(to))
+	}
+	to = filepath.Clean(to)
+	rel, err := filepath.Rel(root, to)
+	if err != nil {
+		return "", err
+	}
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if strings.HasPrefix(part, ".") && part != "." && part != ".." {
+			return "", fmt.Errorf("%s: hidden folders are not part of the library", rel)
+		}
+	}
+	return to, nil
+}
+
+func lastJournal(root string) *journalView {
+	j, _, err := camsync.LastJournal(root)
+	if err != nil {
+		return nil
+	}
+	return &journalView{Time: j.Time.Format(time.RFC3339), Moves: len(j.Moves), Created: len(j.Created)}
+}
+
+// journal answers with the last applied plan that can be undone, or null.
+func (s *Server) journal(w http.ResponseWriter, _ *http.Request) {
+	res, _ := s.current()
+	writeJSON(w, lastJournal(res.Root))
+}
+
+type undoRequest struct {
+	DryRun bool `json:"dryRun"`
+}
+
+// undo moves the photos of the last applied plan back.
+func (s *Server) undo(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(w, r) {
+		return
+	}
+	var req undoRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&req); err != nil {
+		writeError(w, fmt.Errorf("bad request: %w", err), http.StatusBadRequest)
+		return
+	}
+	s.op.Lock()
+	defer s.op.Unlock()
+	res, _ := s.current()
+	ur, err := app.UndoHandler{}.Handle(r.Context(), app.UndoCommand{Root: res.Root, DryRun: req.DryRun})
+	if ur == nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, camsync.ErrNothingToUndo) {
+			status = http.StatusConflict
+		}
+		writeError(w, err, status)
+		return
+	}
+	out := newApplyResponse(ur.ApplyResult)
+	if err != nil {
+		out.JournalError = err.Error()
+	}
+	s.finish(r.Context(), &out, res.Root)
+	writeJSON(w, out)
+}
+
+// parseOptions reads the planning options from a form, starting from the
 // current ones. It reports whether anything changed.
-func parseOptions(q url.Values, cur camsync.LibraryOptions) (camsync.LibraryOptions, bool, error) {
+func parseOptions(q url.Values, root string, cur camsync.LibraryOptions) (camsync.LibraryOptions, bool, error) {
 	opts := cur
 	changed := false
 	dur := func(key string, dst *time.Duration) error {
@@ -359,9 +558,13 @@ func parseOptions(q url.Values, cur camsync.LibraryOptions) (camsync.LibraryOpti
 	if q.Has("inbox") {
 		var inboxes []string
 		for _, v := range q["inbox"] {
-			if v = strings.TrimSpace(v); v != "" {
-				inboxes = append(inboxes, v)
+			if v = strings.TrimSpace(v); v == "" {
+				continue
 			}
+			if !filepath.IsAbs(v) {
+				v = filepath.Join(root, filepath.FromSlash(v))
+			}
+			inboxes = append(inboxes, filepath.Clean(v))
 		}
 		if strings.Join(inboxes, "\x00") != strings.Join(cur.Inboxes, "\x00") {
 			opts.Inboxes, changed = inboxes, true
@@ -370,19 +573,25 @@ func parseOptions(q url.Values, cur camsync.LibraryOptions) (camsync.LibraryOpti
 	return opts, changed, nil
 }
 
-// LibraryJSON is the library as the API sends it. Photos are referred to by
-// their index in the photos list so that events, folders and suggestions
-// stay small.
-type LibraryJSON struct {
+// PlanJSON is what planning the photos yields, as the API sends it. Photos
+// are referred to by their index in the photos list of the library so that
+// events, folders and suggestions stay small, and so that replanning need
+// not send the photos again.
+type PlanJSON struct {
 	Root        string           `json:"root"`
 	Home        *homeView        `json:"home"`
 	Options     optionsView      `json:"options"`
-	Photos      []photoView      `json:"photos"`
 	Events      []eventView      `json:"events"`
 	Folders     []folderView     `json:"folders"`
 	Suggestions []suggestionView `json:"suggestions"`
 	Notes       []noteView       `json:"notes"`
 	Ignored     int              `json:"ignored"`
+}
+
+// LibraryJSON is the library as the API sends it: the plan and the photos.
+type LibraryJSON struct {
+	PlanJSON
+	Photos []photoView `json:"photos"`
 }
 
 type homeView struct {
@@ -398,7 +607,7 @@ type optionsView struct {
 	MinTrip       string   `json:"minTrip"`
 	MinTripPhotos int      `json:"minTripPhotos"`
 	Layout        string   `json:"layout"`
-	Inboxes       []string `json:"inboxes"`
+	Inboxes       []string `json:"inboxes"` // relative to the root, with slashes
 	Home          string   `json:"home"`
 }
 
@@ -478,7 +687,49 @@ type noteView struct {
 // output.
 func View(res *app.OrganizeResult) LibraryJSON { return libraryView(res) }
 
+func slashRel(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return filepath.ToSlash(path)
+	}
+	return filepath.ToSlash(rel)
+}
+
 func libraryView(res *app.OrganizeResult) LibraryJSON {
+	lib := res.Library
+	v := LibraryJSON{PlanJSON: planView(res), Photos: []photoView{}}
+	folderIndex := make(map[string]int, len(lib.Folders))
+	for i, f := range lib.Folders {
+		folderIndex[f.Path] = i
+	}
+	eventOf := map[*camsync.Photo]int{}
+	for i, e := range lib.Events {
+		for _, p := range e.Photos {
+			eventOf[p] = i
+		}
+	}
+	for _, p := range res.Photos {
+		pv := photoView{Path: p.Path, Rel: slashRel(lib.Root, p.Path), Camera: p.Camera, Format: p.Format, Sidecar: p.Sidecar != ""}
+		if p.Original != nil {
+			pv.Time = p.Original.String()
+		}
+		if p.Position != nil {
+			lat, lon := p.Position.Lat, p.Position.Lon
+			pv.Lat, pv.Lon = &lat, &lon
+		}
+		pv.Folder = folderIndex[filepath.Dir(p.Path)]
+		if e, ok := eventOf[p]; ok {
+			pv.Event = &e
+		}
+		if p.Err != nil {
+			pv.Error = p.Err.Error()
+		}
+		v.Photos = append(v.Photos, pv)
+	}
+	return v
+}
+
+func planView(res *app.OrganizeResult) PlanJSON {
 	lib := res.Library
 	index := make(map[*camsync.Photo]int, len(res.Photos))
 	for i, p := range res.Photos {
@@ -499,44 +750,14 @@ func libraryView(res *app.OrganizeResult) LibraryJSON {
 		}
 		return out
 	}
-	eventOf := map[*camsync.Photo]int{}
-	for i, e := range lib.Events {
-		for _, p := range e.Photos {
-			eventOf[p] = i
-		}
-	}
-	v := LibraryJSON{
+	v := PlanJSON{
 		Root: lib.Root, Ignored: res.Ignored,
-		Photos: []photoView{}, Events: []eventView{}, Folders: []folderView{}, Suggestions: []suggestionView{}, Notes: []noteView{},
+		Events: []eventView{}, Folders: []folderView{}, Suggestions: []suggestionView{}, Notes: []noteView{},
 	}
 	if lib.Home != nil {
 		v.Home = &homeView{Lat: lib.Home.Lat, Lon: lib.Home.Lon, Inferred: lib.HomeInferred}
 	}
-	v.Options = optionsJSON(res.Options)
-	for _, p := range res.Photos {
-		rel, err := filepath.Rel(lib.Root, p.Path)
-		if err != nil {
-			rel = p.Path
-		}
-		pv := photoView{Path: p.Path, Rel: filepath.ToSlash(rel), Camera: p.Camera, Format: p.Format, Sidecar: p.Sidecar != ""}
-		if p.Original != nil {
-			pv.Time = p.Original.String()
-		}
-		if p.Position != nil {
-			lat, lon := p.Position.Lat, p.Position.Lon
-			pv.Lat, pv.Lon = &lat, &lon
-		}
-		if f := lib.Folder(filepath.Dir(p.Path)); f != nil {
-			pv.Folder = folderIndex[f]
-		}
-		if e, ok := eventOf[p]; ok {
-			pv.Event = &e
-		}
-		if p.Err != nil {
-			pv.Error = p.Err.Error()
-		}
-		v.Photos = append(v.Photos, pv)
-	}
+	v.Options = optionsJSON(lib.Root, res.Options)
 	for _, e := range lib.Events {
 		ev := eventView{
 			Index: e.Index, Name: e.Name(), Kind: string(e.Kind), First: e.First.Format("2006-01-02 15:04:05"), Last: e.Last.Format("2006-01-02 15:04:05"),
@@ -544,11 +765,6 @@ func libraryView(res *app.OrganizeResult) LibraryJSON {
 		}
 		if e.Placed() {
 			ev.Center = &[2]float64{e.Center.Lat, e.Center.Lon}
-		}
-		for j, f := range lib.Folders {
-			if n := f.Counts[e]; n > 0 {
-				ev.Folders = append(ev.Folders, folderCount{Folder: j, Count: n})
-			}
 		}
 		v.Events = append(v.Events, ev)
 	}
@@ -558,7 +774,9 @@ func libraryView(res *app.OrganizeResult) LibraryJSON {
 			fv.Period = f.Period.String()
 		}
 		for _, e := range f.Events {
-			fv.Events = append(fv.Events, eventCount{Event: eventIndex[e], Count: f.Counts[e]})
+			j := eventIndex[e]
+			fv.Events = append(fv.Events, eventCount{Event: j, Count: f.Counts[e]})
+			v.Events[j].Folders = append(v.Events[j].Folders, folderCount{Folder: i, Count: f.Counts[e]})
 		}
 		v.Folders = append(v.Folders, fv)
 	}
@@ -573,11 +791,7 @@ func libraryView(res *app.OrganizeResult) LibraryJSON {
 			sv.From = &i
 		}
 		if s.To != "" {
-			rel, err := filepath.Rel(lib.Root, s.To)
-			if err != nil {
-				rel = s.To
-			}
-			sv.ToRel = filepath.ToSlash(rel)
+			sv.ToRel = slashRel(lib.Root, s.To)
 			sv.Exists = lib.Folder(s.To) != nil
 		}
 		v.Suggestions = append(v.Suggestions, sv)
@@ -593,7 +807,7 @@ func libraryView(res *app.OrganizeResult) LibraryJSON {
 	return v
 }
 
-func optionsJSON(o camsync.LibraryOptions) optionsView {
+func optionsJSON(root string, o camsync.LibraryOptions) optionsView {
 	def := func(d time.Duration, fallback time.Duration) string {
 		if d <= 0 {
 			d = fallback
@@ -608,7 +822,7 @@ func optionsJSON(o camsync.LibraryOptions) optionsView {
 	}
 	v := optionsView{
 		Gap: def(o.MaxGap, camsync.DefaultEventGap), Jump: dist(o.MaxJump, camsync.DefaultEventJump), HomeRadius: dist(o.HomeRadius, camsync.DefaultHomeRadius),
-		MinTrip: def(o.MinTripSpan, camsync.DefaultMinTripSpan), MinTripPhotos: o.MinTripPhotos, Layout: string(o.Layout), Inboxes: o.Inboxes,
+		MinTrip: def(o.MinTripSpan, camsync.DefaultMinTripSpan), MinTripPhotos: o.MinTripPhotos, Layout: string(o.Layout), Inboxes: []string{},
 	}
 	if v.MinTripPhotos <= 0 {
 		v.MinTripPhotos = camsync.DefaultMinTripPhotos
@@ -616,8 +830,8 @@ func optionsJSON(o camsync.LibraryOptions) optionsView {
 	if v.Layout == "" {
 		v.Layout = string(camsync.LayoutAuto)
 	}
-	if v.Inboxes == nil {
-		v.Inboxes = []string{}
+	for _, in := range o.Inboxes {
+		v.Inboxes = append(v.Inboxes, slashRel(root, in))
 	}
 	if o.Home != nil {
 		v.Home = o.Home.String()

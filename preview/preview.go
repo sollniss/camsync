@@ -16,11 +16,15 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // DefaultSize is the long side of a preview when none is asked for.
@@ -271,11 +275,16 @@ type Cache struct {
 	failed map[string]error
 }
 
+// DefaultCacheLimit is how large the preview cache may grow before Prune
+// deletes the previews used least recently.
+const DefaultCacheLimit = 1 << 30
+
 // NewCache creates a cache in dir, rendering at most workers previews at
-// once (0 selects 2). The directory is created on first use.
+// once (0 selects the number of CPUs). The directory is created on first
+// use.
 func NewCache(dir string, workers int) *Cache {
 	if workers <= 0 {
-		workers = 2
+		workers = runtime.NumCPU()
 	}
 	return &Cache{Dir: dir, sem: make(chan struct{}, workers), failed: map[string]error{}}
 }
@@ -307,6 +316,7 @@ func (c *Cache) Get(path string, size, orientation int) ([]byte, error) {
 	}
 	file := filepath.Join(c.Dir, key[:2], key+".jpg")
 	if data, err := os.ReadFile(file); err == nil {
+		touch(file)
 		return data, nil
 	}
 	c.sem <- struct{}{}
@@ -329,6 +339,62 @@ func (c *Cache) Get(path string, size, orientation int) ([]byte, error) {
 		}
 	}
 	return data, nil
+}
+
+// touch marks a cached preview as used, which Prune goes by. Files used
+// within the last hour are left alone to spare the writes.
+func touch(file string) {
+	st, err := os.Stat(file)
+	if err != nil {
+		return
+	}
+	if now := time.Now(); now.Sub(st.ModTime()) > time.Hour {
+		_ = os.Chtimes(file, now, now)
+	}
+}
+
+// Prune deletes the previews used least recently until the cache holds at
+// most limit bytes, and returns how many bytes it freed.
+func (c *Cache) Prune(limit int64) (int64, error) {
+	type entry struct {
+		path string
+		size int64
+		used time.Time
+	}
+	var entries []entry
+	var total int64
+	err := filepath.WalkDir(c.Dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		entries = append(entries, entry{path, info.Size(), info.ModTime()})
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].used.Before(entries[j].used) })
+	var freed int64
+	for _, e := range entries {
+		if total-freed <= limit {
+			break
+		}
+		if err := os.Remove(e.path); err == nil {
+			freed += e.size
+		}
+	}
+	return freed, nil
 }
 
 func cacheKey(path string, size, orientation int, st os.FileInfo) string {
