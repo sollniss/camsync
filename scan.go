@@ -222,21 +222,45 @@ func LoadPhoto(path string, style SidecarStyle) *Photo {
 // target is where a new sidecar would go and sidecar the existing one, or "".
 func loadPhoto(path, target, sidecar string) *Photo {
 	p := &Photo{Path: path, SidecarTarget: target}
-	tags, format, err := exif.ReadFile(path)
-	p.Format = format
+	meta, err := exif.ReadFileMeta(path)
+	tags := meta.Tags
+	p.Format = meta.Format
 	if err != nil && !errors.Is(err, exif.ErrNotFound) {
 		p.Err = err
 	}
 	p.Make, p.Model = tags[exif.TagMake], tags[exif.TagModel]
 	p.Orientation, _ = strconv.Atoi(tags[exif.TagOrientation])
 	p.FileOriginal, p.FileDigitized = stampsFromExif(tags)
-	p.Original, p.Digitized = p.FileOriginal, p.FileDigitized
 	if gps, ok := ParseGPSTime(tags[exif.TagGPSDateStamp], tags[exif.TagGPSTimeStamp]); ok {
 		p.GPSTime = &gps
 	}
 	if pos, ok := parseDecimalPosition(tags[exif.TagGPSLatitude], tags[exif.TagGPSLongitude]); ok {
 		p.Position = &pos
 	}
+	// Some apps, such as SODA, blank the EXIF values and record the date
+	// only in the XMP packet or the IPTC block embedded in the image. They
+	// fill what EXIF lacks; an unreadable packet is ignored like a missing
+	// one.
+	var app string
+	if len(meta.XMP) > 0 {
+		embedded, _ := xmp.Read(meta.XMP)
+		if p.Make == "" && p.Model == "" {
+			p.Make, p.Model = strings.TrimSpace(embedded[xmp.Make]), strings.TrimSpace(embedded[xmp.Model])
+		}
+		if p.FileOriginal == nil {
+			p.FileOriginal, p.FileDigitized = stampsFromXMP(embedded)
+		}
+		if p.Position == nil {
+			if pos, ok := ParseXMPPosition(embedded[xmp.GPSLatitude], embedded[xmp.GPSLongitude]); ok {
+				p.Position = &pos
+			}
+		}
+		app = AppName(embedded[xmp.CreatorTool])
+	}
+	if p.FileOriginal == nil {
+		p.FileOriginal = stampFromIPTC(meta.IPTC)
+	}
+	p.Original, p.Digitized = p.FileOriginal, p.FileDigitized
 
 	if sc := sidecar; sc != "" {
 		p.Sidecar, p.SidecarTarget = sc, sc
@@ -255,14 +279,12 @@ func loadPhoto(path, target, sidecar string) *Photo {
 		if v := strings.TrimSpace(fields[xmp.Model]); v != "" {
 			p.Model = v
 		}
-		for _, f := range []xmp.Field{xmp.DateTimeOriginal, xmp.CreateDate, xmp.DateCreated} {
-			if s, ok := ParseXMPStamp(fields[f]); ok {
-				p.Original = &s
-				break
-			}
+		orig, dig := stampsFromXMP(fields)
+		if orig != nil {
+			p.Original = orig
 		}
-		if s, ok := ParseXMPStamp(fields[xmp.DateTimeDigitized]); ok {
-			p.Digitized = &s
+		if dig != nil {
+			p.Digitized = dig
 		}
 		if pos, ok := ParseXMPPosition(fields[xmp.GPSLatitude], fields[xmp.GPSLongitude]); ok {
 			p.Position = &pos
@@ -270,7 +292,53 @@ func loadPhoto(path, target, sidecar string) *Photo {
 		}
 	}
 	p.Camera = CameraName(p.Make, p.Model)
+	if p.Camera == UnknownCamera && app != "" {
+		p.Camera = app
+	}
 	return p
+}
+
+// stampsFromXMP derives the timestamps from XMP properties, the original
+// falling back from exif:DateTimeOriginal to xmp:CreateDate to
+// photoshop:DateCreated.
+func stampsFromXMP(fields xmp.Fields) (original, digitized *Stamp) {
+	for _, f := range []xmp.Field{xmp.DateTimeOriginal, xmp.CreateDate, xmp.DateCreated} {
+		if s, ok := ParseXMPStamp(fields[f]); ok {
+			original = &s
+			break
+		}
+	}
+	if s, ok := ParseXMPStamp(fields[xmp.DateTimeDigitized]); ok {
+		digitized = &s
+	}
+	return original, digitized
+}
+
+// stampFromIPTC derives the original timestamp from IPTC datasets,
+// preferring DateCreated to DigitalCreationDate, or returns nil.
+func stampFromIPTC(t exif.IPTCTags) *Stamp {
+	if s, ok := ParseIPTCStamp(t[exif.IPTCDateCreated], t[exif.IPTCTimeCreated]); ok {
+		return &s
+	}
+	if s, ok := ParseIPTCStamp(t[exif.IPTCDigitalCreationDate], t[exif.IPTCDigitalCreationTime]); ok {
+		return &s
+	}
+	return nil
+}
+
+// AppName turns an XMP CreatorTool such as "Snowcorp SODA 10.3.2 / 26.6.2"
+// into the name of the app without its version, "Snowcorp SODA", so that
+// photos from an app that records no camera are grouped across updates. It
+// returns "" when nothing but a version is left, as with iOS's "17.1".
+func AppName(tool string) string {
+	words := strings.Fields(tool)
+	for i, w := range words {
+		if c := w[0]; c >= '0' && c <= '9' || c == '/' || c == '(' || c == 'v' && len(w) > 1 && w[1] >= '0' && w[1] <= '9' {
+			words = words[:i]
+			break
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // ScanOptions controls Scan.

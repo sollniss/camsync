@@ -387,6 +387,14 @@ Timestamps are read from the sidecar first and from the image file only when
 the sidecar has none. The camera name comes from the sidecar's `tiff:Make` and
 `tiff:Model` when present, otherwise from the image.
 
+In the image, EXIF comes first. Some apps, such as SODA, blank every EXIF
+value and record the date only in the XMP packet or IPTC block embedded in a
+JPEG; camsync then uses those (`xmp:CreateDate`, `photoshop:DateCreated`,
+IPTC `DateCreated` + `TimeCreated`), as Immich does. Such photos are named
+after the app in the embedded `xmp:CreatorTool`, without its version
+("Snowcorp SODA"), rather than "Unknown camera". These dates rarely record a
+zone, so `localize` usually needs `--clock-zone` for them.
+
 Sidecar naming: new sidecars are `IMG_0001.JPG.xmp` by default, which is
 what Immich, exiftool and darktable use. `--sidecar-style name` creates
 `IMG_0001.xmp` instead (Adobe, digiKam). Existing sidecars of either style

@@ -38,23 +38,58 @@ func IsSupportedFile(path string) bool {
 // short format label such as "JPEG" or "NEF". It returns ErrNotFound when
 // the file is a recognised image without EXIF data.
 func ReadFile(path string) (Tags, string, error) {
+	m, err := ReadFileMeta(path)
+	return m.Tags, m.Format, err
+}
+
+// Meta is what ReadFileMeta finds in an image.
+type Meta struct {
+	Tags   Tags
+	Format string // short label such as "JPEG" or "NEF"
+	// XMP is the XMP packet embedded in the image, or nil. IPTC holds the
+	// IPTC datasets listed as IPTC* constants, or is nil. Only JPEG files
+	// are searched for either.
+	XMP  []byte
+	IPTC IPTCTags
+}
+
+// IPTCTags holds raw IPTC values keyed by record<<8 | dataset.
+type IPTCTags map[uint16]string
+
+// IPTC datasets that IPTCTags can hold.
+const (
+	IPTCDateCreated         = 2<<8 | 55 // "20060102"
+	IPTCTimeCreated         = 2<<8 | 60 // "150405", optionally with "-0700"
+	IPTCDigitalCreationDate = 2<<8 | 62
+	IPTCDigitalCreationTime = 2<<8 | 63
+)
+
+// ReadFileMeta is ReadFile that also returns the embedded XMP packet, where
+// some apps record the date while leaving EXIF empty. ErrNotFound means the
+// file has no EXIF data; Meta.XMP may still be set.
+func ReadFileMeta(path string) (Meta, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, "", err
+		return Meta{}, err
 	}
 	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil {
-		return nil, "", err
+		return Meta{}, err
 	}
-	return Read(f, st.Size(), filepath.Ext(path))
+	return ReadMeta(f, st.Size(), filepath.Ext(path))
 }
 
 // Read detects the container by its magic bytes and extracts the EXIF tags.
 // size is the total length of r; ext is the file extension (with or without
 // the dot) and is only used to label TIFF-based raw formats.
 func Read(r io.ReaderAt, size int64, ext string) (Tags, string, error) {
-	f := r
+	m, err := ReadMeta(r, size, ext)
+	return m.Tags, m.Format, err
+}
+
+// ReadMeta is Read that also returns the embedded XMP packet.
+func ReadMeta(f io.ReaderAt, size int64, ext string) (m Meta, err error) {
 	head := make([]byte, 16)
 	n, _ := f.ReadAt(head, 0)
 	head = head[:n]
@@ -62,41 +97,45 @@ func Read(r io.ReaderAt, size int64, ext string) (Tags, string, error) {
 	ext = strings.ToUpper(strings.TrimPrefix(ext, "."))
 	switch {
 	case bytes.HasPrefix(head, []byte{0xFF, 0xD8, 0xFF}):
-		tags, err := parseJPEG(f, 0, size)
-		return tags, "JPEG", err
+		var j jpegMeta
+		j, err = parseJPEG(f, 0, size)
+		m.Tags, m.XMP, m.IPTC, m.Format = j.tags, j.xmp, j.iptc, "JPEG"
 	case isTIFFHeader(head):
-		tags, err := ParseTIFF(f, 0, size)
+		m.Tags, err = ParseTIFF(f, 0, size)
 		if ext == "" {
 			ext = "TIFF"
 		}
-		return tags, ext, err
+		m.Format = ext
 	case bytes.HasPrefix(head, []byte("\x89PNG\r\n\x1a\n")):
-		tags, err := parsePNG(f, size)
-		return tags, "PNG", err
+		m.Tags, err = parsePNG(f, size)
+		m.Format = "PNG"
 	case len(head) >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WEBP":
-		tags, err := parseWebP(f, size)
-		return tags, "WebP", err
+		m.Tags, err = parseWebP(f, size)
+		m.Format = "WebP"
 	case len(head) >= 12 && string(head[4:8]) == "ftyp":
 		if string(head[8:12]) == "crx " {
-			tags, err := parseCR3(f, size)
-			return tags, "CR3", err
+			m.Tags, err = parseCR3(f, size)
+			m.Format = "CR3"
+			break
 		}
-		tags, err := parseHEIF(f, size)
+		m.Tags, err = parseHEIF(f, size)
 		if ext != "AVIF" {
 			ext = "HEIF"
 		}
-		return tags, ext, err
+		m.Format = ext
 	case len(head) >= 12 && string(head[4:8]) == "JXL ":
-		tags, err := parseJXL(f, size)
-		return tags, "JXL", err
+		m.Tags, err = parseJXL(f, size)
+		m.Format = "JXL"
 	case bytes.HasPrefix(head, []byte("FUJIFILMCCD-RAW")):
-		tags, err := parseRAF(f, size)
-		return tags, "RAF", err
+		m.Tags, err = parseRAF(f, size)
+		m.Format = "RAF"
 	case bytes.HasPrefix(head, []byte("\x00MRM")):
-		tags, err := parseMRW(f, size)
-		return tags, "MRW", err
+		m.Tags, err = parseMRW(f, size)
+		m.Format = "MRW"
+	default:
+		return Meta{Format: ext}, errors.New("unrecognised image format")
 	}
-	return nil, ext, errors.New("unrecognised image format")
+	return m, err
 }
 
 // parseTIFFMaybePrefixed parses a TIFF block that may start with the
@@ -111,16 +150,38 @@ func parseTIFFMaybePrefixed(r io.ReaderAt, off, size int64) (Tags, error) {
 	return ParseTIFF(r, off, size)
 }
 
-// parseJPEG walks the marker segments looking for the APP1 Exif segment.
-func parseJPEG(r io.ReaderAt, start, end int64) (Tags, error) {
+// xmpHeader starts the APP1 segment holding a JPEG's main XMP packet.
+// ExtendedXMP segments have another header and are not read.
+const xmpHeader = "http://ns.adobe.com/xap/1.0/\x00"
+
+// photoshopHeader starts the APP13 segment holding Photoshop image
+// resources, among them the IPTC datasets.
+const photoshopHeader = "Photoshop 3.0\x00"
+
+// jpegMeta is what parseJPEG finds.
+type jpegMeta struct {
+	tags Tags
+	xmp  []byte
+	iptc IPTCTags
+}
+
+// parseJPEG walks the marker segments looking for the APP1 Exif segment,
+// the APP1 XMP packet and the APP13 IPTC datasets. It returns ErrNotFound,
+// with whatever else it found, when there is no Exif segment.
+func parseJPEG(r io.ReaderAt, start, end int64) (m jpegMeta, err error) {
+	defer func() {
+		if m.tags == nil && err == nil {
+			err = ErrNotFound
+		}
+	}()
 	pos := start + 2
-	for pos+4 <= end {
+	for pos+4 <= end && (m.tags == nil || m.xmp == nil || m.iptc == nil) {
 		b, err := readAt(r, pos, 4)
 		if err != nil {
-			return nil, err
+			return m, err
 		}
 		if b[0] != 0xFF {
-			return nil, fmt.Errorf("jpeg: corrupt marker at offset %d", pos)
+			return m, fmt.Errorf("jpeg: corrupt marker at offset %d", pos)
 		}
 		marker := b[1]
 		switch {
@@ -131,20 +192,83 @@ func parseJPEG(r io.ReaderAt, start, end int64) (Tags, error) {
 			pos += 2
 			continue
 		case marker == 0xD9 || marker == 0xDA: // EOI / SOS: metadata segments are over
-			return nil, ErrNotFound
+			return m, nil
 		}
 		segLen := int64(binary.BigEndian.Uint16(b[2:4]))
 		if segLen < 2 {
-			return nil, fmt.Errorf("jpeg: corrupt segment length at offset %d", pos)
+			return m, fmt.Errorf("jpeg: corrupt segment length at offset %d", pos)
 		}
-		if marker == 0xE1 && segLen >= 8 {
-			if p, err := readAt(r, pos+4, 6); err == nil && string(p) == "Exif\x00\x00" {
-				return ParseTIFF(r, pos+10, segLen-8)
+		data, size := pos+4, segLen-2
+		switch marker {
+		case 0xE1:
+			p, err := readAt(r, data, min(size, int64(len(xmpHeader))))
+			switch {
+			case err != nil:
+			case m.tags == nil && strings.HasPrefix(string(p), "Exif\x00\x00"):
+				// A block of blanked values is no Exif data, but the
+				// segments after it may still hold the date.
+				if m.tags, err = ParseTIFF(r, data+6, size-6); err != nil && !errors.Is(err, ErrNotFound) {
+					return m, err
+				}
+			case m.xmp == nil && string(p) == xmpHeader:
+				n := int64(len(xmpHeader))
+				if p, err := readAt(r, data+n, size-n); err == nil {
+					m.xmp = bytes.TrimRight(p, "\x00") // Apple terminates the packet with a NUL
+				}
+			}
+		case 0xED:
+			if p, err := readAt(r, data, size); err == nil && m.iptc == nil && strings.HasPrefix(string(p), photoshopHeader) {
+				m.iptc = parsePhotoshopIPTC(p[len(photoshopHeader):])
 			}
 		}
 		pos += 2 + segLen
 	}
-	return nil, ErrNotFound
+	return m, nil
+}
+
+// parsePhotoshopIPTC finds the IPTC-NAA resource (ID 0x0404) among
+// Photoshop image resources and extracts its datasets. It returns nil when
+// there is none.
+func parsePhotoshopIPTC(b []byte) IPTCTags {
+	for len(b) >= 8 && string(b[:4]) == "8BIM" {
+		id := binary.BigEndian.Uint16(b[4:6])
+		nameLen := 1 + int(b[6]) // Pascal string, padded to an even length
+		nameLen += nameLen & 1
+		if len(b) < 6+nameLen+4 {
+			return nil
+		}
+		size := int(binary.BigEndian.Uint32(b[6+nameLen:]))
+		b = b[6+nameLen+4:]
+		if size > len(b) {
+			return nil
+		}
+		if id == 0x0404 {
+			return parseIPTC(b[:size])
+		}
+		b = b[min(size+size&1, len(b)):]
+	}
+	return nil
+}
+
+// parseIPTC extracts the IPTC* datasets from an IPTC-NAA block. Of repeated
+// datasets the first wins.
+func parseIPTC(b []byte) IPTCTags {
+	tags := IPTCTags{}
+	for len(b) >= 5 && b[0] == 0x1C {
+		key := uint16(b[1])<<8 | uint16(b[2])
+		n := int(binary.BigEndian.Uint16(b[3:5]))
+		if n&0x8000 != 0 || 5+n > len(b) { // extended datasets are never dates
+			break
+		}
+		switch key {
+		case IPTCDateCreated, IPTCTimeCreated, IPTCDigitalCreationDate, IPTCDigitalCreationTime:
+			if _, dup := tags[key]; !dup {
+				tags[key] = cleanString(b[5 : 5+n])
+			}
+		}
+		b = b[5+n:]
+	}
+	return tags
 }
 
 func parsePNG(r io.ReaderAt, size int64) (Tags, error) {
@@ -481,7 +605,8 @@ func parseRAF(r io.ReaderAt, size int64) (Tags, error) {
 	if off <= 0 || off+length > size {
 		return nil, errors.New("raf: embedded JPEG offset out of range")
 	}
-	return parseJPEG(r, off, off+length)
+	m, err := parseJPEG(r, off, off+length)
+	return m.tags, err
 }
 
 // parseMRW reads the TTW block of a Minolta raw file, which is a TIFF header.

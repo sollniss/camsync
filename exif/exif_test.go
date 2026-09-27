@@ -83,6 +83,34 @@ func TestContainers(t *testing.T) {
 	}
 }
 
+func TestEmbeddedXMPAndIPTC(t *testing.T) {
+	const packet = `<x:xmpmeta xmlns:x="adobe:ns:meta/"/>`
+	iptc := testimg.IPTCSegment(
+		testimg.IPTCDataset{Key: exif.IPTCDateCreated, Value: "20260911"},
+		testimg.IPTCDataset{Key: 2<<8 | 25, Value: "keyword"}, // not extracted
+		testimg.IPTCDataset{Key: exif.IPTCTimeCreated, Value: "211258+0900"},
+		testimg.IPTCDataset{Key: exif.IPTCDateCreated, Value: "19990101"}, // repeated: first wins
+	)
+	tiff := testimg.BuildTIFF(binary.LittleEndian, ifd0, exifIFD)
+	m, err := exif.ReadFileMeta(writeTemp(t, "a.jpg", testimg.JPEGWith(tiff, testimg.XMPSegment(packet), iptc)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Tags[exif.TagMake] != "Canon" || string(m.XMP) != packet {
+		t.Errorf("tags %v, xmp %q", m.Tags, m.XMP)
+	}
+	want := exif.IPTCTags{exif.IPTCDateCreated: "20260911", exif.IPTCTimeCreated: "211258+0900"}
+	if len(m.IPTC) != len(want) || m.IPTC[exif.IPTCDateCreated] != want[exif.IPTCDateCreated] || m.IPTC[exif.IPTCTimeCreated] != want[exif.IPTCTimeCreated] {
+		t.Errorf("iptc %v, want %v", m.IPTC, want)
+	}
+
+	// Without an Exif segment the rest is still returned.
+	m, err = exif.ReadFileMeta(writeTemp(t, "b.jpg", testimg.JPEGWith(nil, testimg.XMPSegment(packet))))
+	if err != exif.ErrNotFound || string(m.XMP) != packet || m.Format != "JPEG" {
+		t.Errorf("no exif: err %v, xmp %q, format %q", err, m.XMP, m.Format)
+	}
+}
+
 func TestNoExifAndGarbage(t *testing.T) {
 	p := writeTemp(t, "plain.jpg", []byte{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9})
 	if _, _, err := exif.ReadFile(p); err != exif.ErrNotFound {

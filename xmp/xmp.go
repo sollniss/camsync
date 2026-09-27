@@ -40,6 +40,7 @@ var (
 	DateTimeDigitized = Field{NSExif, "DateTimeDigitized"}
 	CreateDate        = Field{NSXMP, "CreateDate"}
 	ModifyDate        = Field{NSXMP, "ModifyDate"}
+	CreatorTool       = Field{NSXMP, "CreatorTool"}
 	DateCreated       = Field{NSPhotoshop, "DateCreated"}
 	Make              = Field{NSTIFF, "Make"}
 	Model             = Field{NSTIFF, "Model"}

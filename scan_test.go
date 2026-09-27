@@ -250,6 +250,54 @@ func TestCameraName(t *testing.T) {
 	}
 }
 
+func TestAppName(t *testing.T) {
+	for in, want := range map[string]string{
+		"Snowcorp SODA 10.3.2 / 26.6.2":     "Snowcorp SODA",
+		"Adobe Photoshop CC 2019 (Windows)": "Adobe Photoshop CC",
+		"darktable v4.6.1":                  "darktable",
+		"17.1":                              "",
+		"  ":                                "",
+		"Snapseed":                          "Snapseed",
+	} {
+		if got := AppName(in); got != want {
+			t.Errorf("AppName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Apps like SODA keep an EXIF block with every value blanked and record the
+// date in the embedded XMP packet or IPTC block only.
+func TestEmbeddedDatesFillBlankExif(t *testing.T) {
+	dir := t.TempDir()
+	blank := testimg.BuildTIFF(binary.BigEndian, []testimg.Entry{testimg.ASCII(exif.TagMake, ""), testimg.ASCII(exif.TagModel, "")}, nil)
+	const soda = `<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">` +
+		`<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"` +
+		` xmp:CreateDate="2026-09-11T21:12:47" xmp:CreatorTool="Snowcorp SODA 10.3.2 / 26.6.2" photoshop:DateCreated="2026-09-11T21:12:47"/>` +
+		`</rdf:RDF></x:xmpmeta>`
+	iptc := testimg.IPTCSegment(
+		testimg.IPTCDataset{Key: exif.IPTCDateCreated, Value: "20260911"},
+		testimg.IPTCDataset{Key: exif.IPTCTimeCreated, Value: "211258"},
+	)
+	mustWrite(t, filepath.Join(dir, "xmp.jpg"), testimg.JPEGWith(blank, testimg.XMPSegment(soda), iptc))
+	mustWrite(t, filepath.Join(dir, "iptc.jpg"), testimg.JPEGWith(blank, iptc))
+	// EXIF wins over both.
+	mustWrite(t, filepath.Join(dir, "exif.jpg"), testimg.JPEGWith(testimg.Simple("Canon", "Canon EOS R5", "2024:05:01 12:00:00"), testimg.XMPSegment(soda), iptc))
+
+	for _, c := range []struct{ file, camera, original string }{
+		{"xmp.jpg", "Snowcorp SODA", "2026-09-11T21:12:47"},
+		{"iptc.jpg", UnknownCamera, "2026-09-11T21:12:58"},
+		{"exif.jpg", "Canon EOS R5", "2024-05-01T12:00:00"},
+	} {
+		p := LoadPhoto(filepath.Join(dir, c.file), SidecarByExt)
+		if p.Err != nil || p.Camera != c.camera || p.FileOriginal == nil || p.Original == nil || p.Original.XMP() != c.original {
+			t.Errorf("%s: err %v, camera %q, original %v, want %q %q", c.file, p.Err, p.Camera, p.Original, c.camera, c.original)
+		}
+		if p.Make != "" && c.camera == "Snowcorp SODA" {
+			t.Errorf("%s: the app name must not become Make (it would be written to sidecars): %q", c.file, p.Make)
+		}
+	}
+}
+
 func TestZones(t *testing.T) {
 	dir := t.TempDir()
 	// Canon file: zone comes from the maker note and must survive the shift.

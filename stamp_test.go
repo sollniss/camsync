@@ -70,6 +70,21 @@ func TestStamps(t *testing.T) {
 			t.Errorf("ParseXMPStamp(%q) should fail", bad)
 		}
 	}
+	for in, want := range map[[2]string]string{
+		{"20260911", "211258"}:        "2026-09-11T21:12:58",
+		{"20260911", "211258+0900"}:   "2026-09-11T21:12:58+09:00",
+		{" 20260911 ", "074152-0530"}: "2026-09-11T07:41:52-05:30",
+	} {
+		got, ok := ParseIPTCStamp(in[0], in[1])
+		if !ok || got.XMP() != want {
+			t.Errorf("ParseIPTCStamp(%q, %q) = %q %v, want %q", in[0], in[1], got.XMP(), ok, want)
+		}
+	}
+	for _, bad := range [][2]string{{"20260911", ""}, {"", "211258"}, {"00000000", "000000"}, {"2026-09-11", "21:12:58"}} {
+		if _, ok := ParseIPTCStamp(bad[0], bad[1]); ok {
+			t.Errorf("ParseIPTCStamp(%q, %q) should fail", bad[0], bad[1])
+		}
+	}
 	if _, ok := ParseExifStamp("0000:00:00 00:00:00", "", ""); ok {
 		t.Error("zero EXIF date should be rejected")
 	}

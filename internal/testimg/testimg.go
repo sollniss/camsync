@@ -115,16 +115,67 @@ func Box(typ string, payload ...[]byte) []byte {
 
 // JPEG wraps tiff into a JPEG with an APP0 segment before the APP1 Exif.
 func JPEG(tiff []byte) []byte {
+	return JPEGWith(tiff)
+}
+
+// JPEGWith is JPEG with extra segments, such as XMPSegment and IPTCSegment,
+// after the Exif one. A nil tiff leaves the Exif segment out.
+func JPEGWith(tiff []byte, segments ...[]byte) []byte {
 	var b bytes.Buffer
 	b.Write([]byte{0xFF, 0xD8})
-	app0 := append([]byte("JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"), 0)
-	b.Write([]byte{0xFF, 0xE0, byte((len(app0) + 2) >> 8), byte(len(app0) + 2)})
-	b.Write(app0)
-	app1 := append([]byte("Exif\x00\x00"), tiff...)
-	b.Write([]byte{0xFF, 0xE1, byte((len(app1) + 2) >> 8), byte(len(app1) + 2)})
-	b.Write(app1)
+	b.Write(segment(0xE0, append([]byte("JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"), 0)))
+	if tiff != nil {
+		b.Write(segment(0xE1, append([]byte("Exif\x00\x00"), tiff...)))
+	}
+	for _, s := range segments {
+		b.Write(s)
+	}
 	b.Write([]byte{0xFF, 0xDA, 0x00, 0x02, 0x00, 0xFF, 0xD9})
 	return b.Bytes()
+}
+
+func segment(marker byte, data []byte) []byte {
+	return append([]byte{0xFF, marker, byte((len(data) + 2) >> 8), byte(len(data) + 2)}, data...)
+}
+
+// XMPSegment builds the APP1 segment of a JPEG's XMP packet, with the NUL
+// terminator Apple adds.
+func XMPSegment(packet string) []byte {
+	return segment(0xE1, []byte("http://ns.adobe.com/xap/1.0/\x00"+packet+"\x00"))
+}
+
+// IPTCSegment builds the APP13 segment carrying the IPTC datasets, each a
+// record<<8 | dataset key with its value, in Photoshop image resources. An
+// unrelated resource comes first.
+func IPTCSegment(datasets ...IPTCDataset) []byte {
+	var iptc []byte
+	for _, d := range datasets {
+		iptc = append(iptc, 0x1C, byte(d.Key>>8), byte(d.Key), byte(len(d.Value)>>8), byte(len(d.Value)))
+		iptc = append(iptc, d.Value...)
+	}
+	resource := func(id uint16, name string, data []byte) []byte {
+		r := append([]byte("8BIM"), byte(id>>8), byte(id), byte(len(name)))
+		r = append(r, name...)
+		if len(name)%2 == 0 {
+			r = append(r, 0) // pad the Pascal string to an even length
+		}
+		r = append(r, be32(len(data))...)
+		r = append(r, data...)
+		if len(data)%2 == 1 {
+			r = append(r, 0)
+		}
+		return r
+	}
+	data := []byte("Photoshop 3.0\x00")
+	data = append(data, resource(0x0425, "", []byte{1, 2, 3})...) // odd length: padded
+	data = append(data, resource(0x0404, "", iptc)...)
+	return segment(0xED, data)
+}
+
+// IPTCDataset is one IPTC value for IPTCSegment.
+type IPTCDataset struct {
+	Key   uint16
+	Value string
 }
 
 // PNG wraps tiff into an eXIf chunk, optionally with the "Exif\0\0" prefix

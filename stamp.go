@@ -97,8 +97,10 @@ var (
 	exifDateRe = regexp.MustCompile(`^(\d{4})[:\-](\d{2})[:\-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})$`)
 	// XMP: ISO 8601 with optional time, fraction and zone.
 	xmpDateRe = regexp.MustCompile(`^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?)?(Z|[+-]\d{2}:\d{2})?$`)
-	tzRe      = regexp.MustCompile(`^[+-]\d{2}:\d{2}$`)
-	digitsRe  = regexp.MustCompile(`^\d+$`)
+	// IPTC: DateCreated and TimeCreated joined by a space, "20060102 150405-0700".
+	iptcDateRe = regexp.MustCompile(`^(\d{4})(\d{2})(\d{2}) (\d{2})(\d{2})(\d{2})(?:([+-]\d{2})(\d{2}))?$`)
+	tzRe       = regexp.MustCompile(`^[+-]\d{2}:\d{2}$`)
+	digitsRe   = regexp.MustCompile(`^\d+$`)
 )
 
 func makeStamp(parts []string) (Stamp, bool) {
@@ -133,6 +135,24 @@ func ParseExifStamp(dt, subsec, tz string) (Stamp, bool) {
 	tz = strings.TrimSpace(tz)
 	if tz == "Z" || tzRe.MatchString(tz) {
 		s.TZ = tz
+	}
+	return s, true
+}
+
+// ParseIPTCStamp builds a Stamp from an IPTC date ("20060102") and time
+// ("150405", optionally followed by a zone such as "+0900"). A date without
+// a time is refused as too coarse.
+func ParseIPTCStamp(date, clock string) (Stamp, bool) {
+	m := iptcDateRe.FindStringSubmatch(strings.TrimSpace(date) + " " + strings.TrimSpace(clock))
+	if m == nil {
+		return Stamp{}, false
+	}
+	s, ok := makeStamp(m[1:7])
+	if !ok {
+		return Stamp{}, false
+	}
+	if m[7] != "" {
+		s.TZ = m[7] + ":" + m[8]
 	}
 	return s, true
 }
