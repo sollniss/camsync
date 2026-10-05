@@ -9,11 +9,9 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	goruntime "runtime"
 	"sort"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
@@ -24,7 +22,7 @@ import (
 )
 
 func (rt *runtime) organizeCommand() *cobra.Command {
-	var ui, open, dryRun, verbose, undo bool
+	var open, dryRun, verbose, undo bool
 	var listen, tiles, planFile, applyFile, gap, jump, home, homeRadius, minTrip, layout string
 	var minTripPhotos int
 	var inboxes []string
@@ -33,7 +31,9 @@ func (rt *runtime) organizeCommand() *cobra.Command {
 		Short: "Find the events in a photo library and suggest where photos belong",
 		Long: `Organize scans a whole library, groups the photos of all cameras into
 events by time and place, works out what each folder holds and suggests
-moves that tidy the library up. Nothing is moved unless a plan is applied.
+moves that tidy the library up. The result is served to the browser with a
+timeline, a map and previews, where suggestions can be accepted one by one
+and applied. Nothing is moved unless a plan is applied.
 
 An event is a run of photos with no pause longer than --gap between them
 and no jump further than --jump between located photos. Photos are placed
@@ -63,17 +63,18 @@ medium when one side is placed by time alone and low when the event has no
 positions at all. --layout trips also pulls trips out of period folders;
 --layout periods never creates trip folders.
 
---ui opens the same picture in the browser with a timeline, a map and
-previews, where suggestions can be accepted one by one and applied. The
-map loads its tiles from OpenStreetMap, which learns which areas are
+The server runs until it is interrupted; --open also opens the browser.
+The map loads its tiles from OpenStreetMap, which learns which areas are
 looked at; --tiles none turns it off.
---plan writes every suggestion with a destination to a file to review by
-hand; --apply carries out such a file, or one saved from the browser.
+Without a browser, --plan writes every suggestion with a destination to a
+file to review by hand and -o json prints the whole picture; neither
+starts the server. --apply carries out a plan file, or one saved from the
+browser.
 Every applied plan is recorded under DIR/.camsync/journal, and --undo
 moves its photos back. Moving files confuses catalog applications such as
 Lightroom, which reference files by path.`,
 		Example: `  camsync organize ~/Photos
-  camsync organize --ui ~/Photos
+  camsync organize --open ~/Photos
   camsync organize --inbox Inbox --home 52.52,13.40 ~/Photos
   camsync organize --plan plan.json ~/Photos && camsync organize --apply plan.json --dry-run
   camsync organize --undo ~/Photos
@@ -119,26 +120,27 @@ Lightroom, which reference files by path.`,
 			if err != nil {
 				return err
 			}
-			if ui {
-				return serveUI(cmd.Context(), cmd.ErrOrStderr(), q.Scope, res, listen, open, web.Config{Tiles: tileURL(tiles)})
-			}
+			moves := 0
 			if planFile != "" {
-				if err := writePlan(planFile, res); err != nil {
+				if moves, err = writePlan(planFile, res); err != nil {
 					return err
 				}
 			}
 			if rt.json() {
 				return writeJSON(out, web.View(res))
 			}
-			return printOrganize(out, res, verbose, planFile)
+			if planFile != "" {
+				fmt.Fprintf(out, "%d photos to move. Plan written to %s; review it, then run: camsync organize --apply %s --dry-run\n", moves, planFile, planFile)
+				return nil
+			}
+			return serveUI(cmd.Context(), cmd.ErrOrStderr(), q.Scope, res, listen, open, web.Config{Tiles: tileURL(tiles)})
 		}),
 	}
 	f := cmd.Flags()
-	f.BoolVar(&ui, "ui", false, "open the library in the browser instead of printing")
-	f.StringVar(&listen, "listen", "127.0.0.1:0", "address the --ui server listens on")
-	f.StringVar(&tiles, "tiles", web.OSMTiles, `map tiles of the --ui, as a URL with {z}, {x} and {y}, or "none" for no map`)
-	f.BoolVar(&open, "open", false, "with --ui, open the browser")
-	f.StringVar(&planFile, "plan", "", "write the suggestions as a plan file to apply later")
+	f.StringVar(&listen, "listen", "127.0.0.1:0", "address the server listens on")
+	f.StringVar(&tiles, "tiles", web.OSMTiles, `map tiles, as a URL with {z}, {x} and {y}, or "none" for no map`)
+	f.BoolVar(&open, "open", false, "open the browser once the server listens")
+	f.StringVar(&planFile, "plan", "", "write the suggestions as a plan file to apply later instead of serving them")
 	f.StringVar(&applyFile, "apply", "", "carry out the moves of a plan file instead of scanning")
 	f.BoolVar(&undo, "undo", false, "move the photos of the plan last applied to DIR back; repeat to go further back")
 	f.BoolVarP(&dryRun, "dry-run", "n", false, "with --apply or --undo, report what would move without moving anything")
@@ -150,7 +152,7 @@ Lightroom, which reference files by path.`,
 	f.IntVar(&minTripPhotos, "min-trip-photos", 0, "how many photos an event without a location needs to be a trip (default 10)")
 	f.StringVar(&layout, "layout", "auto", `"auto", "trips" (pull trips out of period folders too) or "periods" (never create trip folders)`)
 	f.StringArrayVar(&inboxes, "inbox", nil, "folder where photos land before they are sorted, relative to DIR; repeat for several")
-	f.BoolVarP(&verbose, "verbose", "v", false, "also list every photo of every suggestion")
+	f.BoolVarP(&verbose, "verbose", "v", false, "with --apply or --undo, list every move")
 	registerCompletions(cmd, map[string]cobra.CompletionFunc{
 		"layout": cobra.FixedCompletions([]cobra.Completion{
 			cobra.CompletionWithDesc("auto", "keep every folder's own scheme"),
@@ -254,17 +256,18 @@ func openBrowser(url string) error {
 	return cmd.Start()
 }
 
-// writePlan writes every suggestion that has a destination.
-func writePlan(path string, res *app.OrganizeResult) error {
+// writePlan writes every suggestion that has a destination and reports how
+// many photos the plan moves.
+func writePlan(path string, res *app.OrganizeResult) (int, error) {
 	plan := camsync.Plan{Root: res.Root, Moves: []camsync.Move{}}
 	for _, s := range res.Suggestions {
 		plan.Moves = append(plan.Moves, s.Moves()...)
 	}
 	data, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o644)
+	return len(plan.Moves), os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
 // applyPlan reads a plan file and carries it out.
@@ -388,108 +391,4 @@ func applyView(res *camsync.ApplyResult) applyJSON {
 		v.Results = append(v.Results, mv)
 	}
 	return v
-}
-
-// printOrganize renders the events, the folders, the suggestions and the
-// notes as tables.
-func printOrganize(w io.Writer, res *app.OrganizeResult, verbose bool, planFile string) error {
-	rel := func(path string) string {
-		r, err := filepath.Rel(res.Root, path)
-		if err != nil {
-			return path
-		}
-		if r == "." {
-			return "(root)"
-		}
-		return r
-	}
-	switch {
-	case res.Home == nil:
-		fmt.Fprintln(w, "HOME  unknown: no photo has a position, so events cannot be told from trips at home")
-	case res.HomeInferred:
-		fmt.Fprintf(w, "HOME  %s (inferred: photos on the most days; override with --home)\n", res.Home)
-	default:
-		fmt.Fprintf(w, "HOME  %s\n", res.Home)
-	}
-
-	fmt.Fprintln(w, "\nEVENTS")
-	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "#\tDATES\tKIND\tPHOTOS\tLOCATED\tCAMERAS\tFOLDERS")
-	for _, e := range res.Events {
-		cameras := make([]string, 0, len(e.Cameras))
-		for c := range e.Cameras {
-			cameras = append(cameras, c)
-		}
-		sort.Strings(cameras)
-		var folders []string
-		for _, f := range res.Folders {
-			if n := f.Counts[e]; n > 0 {
-				folders = append(folders, fmt.Sprintf("%s (%d)", rel(f.Path), n))
-			}
-		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%d\t%s\t%s\n", e.Index, e.Name(), e.Kind, len(e.Photos), e.Located, strings.Join(cameras, ", "), strings.Join(folders, ", "))
-	}
-	if err := tw.Flush(); err != nil {
-		return err
-	}
-
-	fmt.Fprintln(w, "\nFOLDERS")
-	tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "FOLDER\tKIND\tPHOTOS\tEVENTS\tNOTE")
-	for _, f := range res.Folders {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%d\t%s\n", rel(f.Path), f.Kind, len(f.Photos), len(f.Events), f.Note)
-	}
-	if err := tw.Flush(); err != nil {
-		return err
-	}
-
-	fmt.Fprintln(w, "\nSUGGESTIONS")
-	if len(res.Suggestions) == 0 {
-		fmt.Fprintln(w, "nothing to tidy with these settings")
-	} else {
-		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tACTION\tPHOTOS\tCONFIDENCE\tFROM\tTO\tREASON")
-		moves := 0
-		for _, s := range res.Suggestions {
-			from, to := "several", "-"
-			if s.From != nil {
-				from = rel(s.From.Path)
-			}
-			if s.To != "" {
-				to = rel(s.To)
-				if res.Folder(s.To) == nil {
-					to += " (new)"
-				}
-				moves += len(s.Photos)
-			}
-			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n", s.ID, s.Kind, len(s.Photos), s.Confidence, from, to, s.Reason)
-			if verbose {
-				for _, p := range s.Photos {
-					fmt.Fprintf(tw, "\t\t\t\t%s\t\t\n", rel(p.Path))
-				}
-			}
-		}
-		if err := tw.Flush(); err != nil {
-			return err
-		}
-		fmt.Fprintf(w, "\n%d suggestions, %d photos to move.", len(res.Suggestions), moves)
-		if planFile != "" {
-			fmt.Fprintf(w, " Plan written to %s; review it, then run: camsync organize --apply %s --dry-run\n", planFile, planFile)
-		} else {
-			fmt.Fprintln(w, " Review them with --ui, or write them with --plan FILE and apply with --apply FILE.")
-		}
-	}
-
-	if len(res.Notes) > 0 {
-		fmt.Fprintln(w, "\nNOTES")
-		for _, n := range res.Notes {
-			fmt.Fprintf(w, "- %s\n", n.Text)
-			if verbose {
-				for _, p := range n.Photos {
-					fmt.Fprintf(w, "    %s\n", rel(p.Path))
-				}
-			}
-		}
-	}
-	return nil
 }

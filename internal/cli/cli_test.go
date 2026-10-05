@@ -6,9 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -653,20 +655,76 @@ func libraryDir(t *testing.T) string {
 	return root
 }
 
+// syncBuffer is a buffer a command can write to while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestOrganizeServes(t *testing.T) {
+	root := libraryDir(t)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out, errb syncBuffer
+	done := make(chan int, 1)
+	go func() { done <- Main(ctx, []string{"organize", "--tiles", "none", root}, &out, &errb) }()
+
+	// The URL is announced on stderr once the server listens.
+	var url string
+	for deadline := time.Now().Add(10 * time.Second); url == ""; time.Sleep(10 * time.Millisecond) {
+		if _, rest, ok := strings.Cut(errb.String(), " at "); ok {
+			url, _, _ = strings.Cut(rest, " ")
+		}
+		select {
+		case code := <-done:
+			t.Fatalf("exited with %d before serving: %s", code, errb.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no URL announced: %q", errb.String())
+		}
+	}
+	resp, err := http.Get(url + "api/library")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var v struct {
+		Root        string           `json:"root"`
+		Suggestions []map[string]any `json:"suggestions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil || v.Root != root || len(v.Suggestions) != 1 {
+		t.Errorf("library: %v %+v", err, v)
+	}
+
+	// Interrupting the server is how it is meant to end.
+	cancel()
+	if code := <-done; code != ExitOK || out.String() != "" {
+		t.Errorf("code %d, stdout %q, stderr %q", code, out.String(), errb.String())
+	}
+}
+
 func TestOrganizeReportPlanAndApply(t *testing.T) {
 	root := libraryDir(t)
-	code, out, errOut := run(t, "organize", root)
+	code, out, errOut := run(t, "organize", "-o", "json", "--home", "52.52,13.40", "--layout", "periods", root)
 	if code != 0 || errOut != "" {
 		t.Fatalf("code %d, stderr %q", code, errOut)
 	}
-	for _, want := range []string{"HOME  ", "EVENTS", "FOLDERS", "Inbox", "inbox", "Trips/Rügen", "event", "SUGGESTIONS", "  move    2       high", "1 suggestions, 2 photos to move"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("report lacks %q:\n%s", want, out)
-		}
-	}
-	code, out, _ = run(t, "organize", "-v", "--home", "52.52,13.40", "--layout", "periods", root)
-	if code != 0 || !strings.Contains(out, "Inbox/p2.jpg") || strings.Contains(out, "inferred") {
-		t.Errorf("verbose: code %d\n%s", code, out)
+	if !strings.Contains(out, `"inferred": false`) {
+		t.Errorf("--home: %s", out)
 	}
 
 	code, out, _ = run(t, "organize", "-o", "json", root)
@@ -692,7 +750,7 @@ func TestOrganizeReportPlanAndApply(t *testing.T) {
 	// Write a plan, dry-run it, apply it.
 	plan := filepath.Join(t.TempDir(), "plan.json")
 	code, out, _ = run(t, "organize", "--plan", plan, root)
-	if code != 0 || !strings.Contains(out, "Plan written to "+plan) {
+	if code != 0 || !strings.Contains(out, "2 photos to move. Plan written to "+plan) {
 		t.Fatalf("plan: %d\n%s", code, out)
 	}
 	data, err := os.ReadFile(plan)

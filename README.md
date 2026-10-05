@@ -24,7 +24,7 @@ camsync shift    [DIR] --camera NAME [--by DURATION] [--timezone OFFSET] [--dry-
 camsync localize [DIR] [--camera NAME] [--zone OFFSET] [--zone-gap DURATION] [--clock-zone NAME=ZONE]... [--dry-run] [-v]
 camsync geotag   [DIR] [--camera NAME] [--gpx FILE]... [--max-gap DURATION] [--max-bridge DURATION] [--max-distance METRES] [--dry-run] [-v]
 camsync reset    [DIR] --camera NAME [--dry-run]
-camsync organize [DIR] [--ui] [--tiles URL|none] [--gap DURATION] [--jump DISTANCE] [--home LAT,LON] [--inbox DIR]... [--layout auto|trips|periods] [--plan FILE] [--apply FILE] [--undo] [--dry-run]
+camsync organize [DIR] [--open] [--listen ADDR] [--tiles URL|none] [--gap DURATION] [--jump DISTANCE] [--home LAT,LON] [--inbox DIR]... [--layout auto|trips|periods] [--plan FILE] [--apply FILE] [--undo] [--dry-run] [-v]
 ```
 
 1. See which cameras are in the directory:
@@ -60,8 +60,8 @@ camsync organize [DIR] [--ui] [--tiles URL|none] [--gap DURATION] [--jump DISTAN
    `geotag` wrote.
 
 6. Tidy the whole library with `organize`, which finds the trips among all
-   folders and suggests merges and moves, on the command line or in the
-   browser with `--ui` (see [Organizing a library](#organizing-a-library)).
+   folders and suggests merges and moves to review in the browser
+   (see [Organizing a library](#organizing-a-library)).
 
 Durations: `2m30s`, `-45s`, `1h`, `+1d2h`. A leading sign applies to the whole
 value. `--timezone +02:00` (or `--tz`) stamps a zone on the written dates (see Timezones). Add
@@ -227,36 +227,12 @@ removes them while keeping locations from anywhere else.
 
 `organize` looks at a whole library rather than one trip. It groups the
 photos of every camera into events by time and place, works out what each
-folder holds and suggests where photos would rather be. Nothing is moved
-until a plan is applied:
+folder holds and suggests where photos would rather be. What it finds is
+served to the browser until it is interrupted; `--open` opens the browser
+too. Nothing is moved until a plan is applied:
 
-```
-$ camsync organize ~/Photos
-HOME  52.5238467, 13.4038401 (inferred: photos on the most days; override with --home)
-
-EVENTS
-#   DATES                    KIND    PHOTOS  LOCATED  CAMERAS                                       FOLDERS
-26  2024-05-10 - 2024-05-13  trip    53      13       Apple iPhone 15, Canon EOS R5, SONY ILCE-7M3  Inbox (12), Trips/Rügen Canon (20), Trips/Rügen Sony (20), 2024-05 (1)
-34  2024-09-02 - 2024-09-06  trip    40      20       Apple iPhone 15, Canon EOS R5                 Inbox (40)
-...
-
-FOLDERS
-FOLDER             KIND    PHOTOS  EVENTS  NOTE
-2024-05            period  10      10      named after a month
-Inbox              inbox   63      9       named like an inbox
-Trips/Rügen Canon  event   21      2       holds one event
-Trips/Rügen Sony   event   20      1       holds one event
-
-SUGGESTIONS
-ID         ACTION  PHOTOS  CONFIDENCE  FROM               TO                                   REASON
-s3f9a07c1  move    12      medium      Inbox              Trips/Rügen Canon                    part of the event kept in Trips/Rügen Canon: ...
-s8be2d4a0  merge   20      medium      Trips/Rügen Sony   Trips/Rügen Canon                    Trips/Rügen Sony holds the same event as Trips/Rügen Canon: ...
-s05c7e19d  create  40      high        Inbox              Trips/2024-09-02 - 2024-09-06 (new)  a trip without a folder, in Inbox: ...
-s6d14b3e8  create  1       high        2024-03            2024-07 (new)                        taken outside 2024-03
-sa2e05f73  move    1       high        Trips/Rügen Canon  Inbox                                not part of the event kept in Trips/Rügen Canon: ...
-
-NOTES
-- Panasonic DMC-TZ100: 5 photos dated from 2010-01-01 00:05; the clock looks reset, fix the dates before sorting
+```sh
+camsync organize --open ~/Photos
 ```
 
 An event ends where the pause until the next photo exceeds `--gap` (default
@@ -302,7 +278,7 @@ trip; `--layout periods` never creates trip folders. Confidence is high when
 positions place the event on both sides, medium when one side is placed by
 time alone and low when only time says so.
 
-`--ui` opens the same picture in the browser: a timeline of the events, a
+The browser shows a timeline of the events, a
 map, the folder tree, and the suggestions with previews of the photos they
 concern. Change the thresholds or mark a folder as an inbox and replan
 without scanning again. Accept suggestions one by one or all of high
@@ -313,10 +289,6 @@ browser per library, and the selection in the URL, so a reload loses
 nothing. `j`/`k` go through the suggestions, `x` accepts, `e` changes the
 destination; `?` lists the rest.
 
-```sh
-camsync organize --ui --open ~/Photos
-```
-
 Previews come from the JPEG that raw files embed, cached under the user's
 cache directory, which is trimmed to 1 GiB. The map loads its tiles from
 OpenStreetMap, which learns which areas are looked at; `--tiles URL` uses
@@ -326,8 +298,9 @@ the loopback interface and answers only requests addressed to an IP address,
 reach it by pointing a name of theirs at 127.0.0.1. Listening on another
 interface prints a warning: there is no password.
 
-From the command line, `--plan plan.json` writes every suggestion with a
-destination as a plan file, a JSON list of moves to review or edit;
+Without a browser, `--plan plan.json` writes every suggestion with a
+destination as a plan file, a JSON list of moves to review or edit, and
+`-o json` prints everything that was found; neither starts the server.
 `--apply plan.json` carries it out, `--dry-run` first. The browser's *Save
 plan* button writes the same file. Photos are renamed, never copied over an
 existing file, and their sidecars move with them. Catalog applications such
