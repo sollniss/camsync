@@ -121,8 +121,8 @@ func medianDuration(ds []time.Duration) time.Duration {
 var phoneModels = map[string]*regexp.Regexp{
 	"apple":          regexp.MustCompile(`^(iphone|ipad)`),
 	"google":         regexp.MustCompile(`^pixel`),
-	"samsung":        regexp.MustCompile(`^(sm-|gt-|sgh-|sch-|galaxy)`),
-	"sony":           regexp.MustCompile(`^(xq-|so-|sov|xperia|[c-j]\d{4}$)`),
+	"samsung":        regexp.MustCompile(`^(sm-|gt-|sgh-|sch-|sph-|shv-|shw-|scv|scg|scl|sc-\d|\d{3}sc$|galaxy|nexus)`),
+	"sony":           regexp.MustCompile(`^(xq-|so-|sov|sol|sog|sot|xperia|[c-j]\d{4}$|a?\d{3}so$)`),
 	"asus":           regexp.MustCompile(`^(asus_|zenfone)`),
 	"microsoft":      regexp.MustCompile(`^lumia`),
 	"xiaomi":         nil,
@@ -146,6 +146,9 @@ var phoneModels = map[string]*regexp.Regexp{
 	"lenovo":         nil,
 	"blackberry":     nil,
 	"meizu":          nil,
+	"sharp":          nil,
+	"fcnt":           nil,
+	"fujitsu":        nil,
 }
 
 // IsPhone reports whether Make and Model name a phone or tablet.
